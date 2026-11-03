@@ -52,27 +52,42 @@ let
     libxrender
   ];
 
+  # Растры знака лежат в hicolor-раскладке прямо в репозитории; SVG там же —
+  # его ставят в scalable, чтобы не масштабировать 16 px до 512.
+  iconSizes = [
+    "16x16"
+    "24x24"
+    "32x32"
+    "48x48"
+    "64x64"
+    "128x128"
+    "256x256"
+    "512x512"
+  ];
+
   desktopItem = makeDesktopItem {
-    name = "umulaunch";
+    name = "protonaut";
     type = "Application";
-    desktopName = "umulaunch";
+    desktopName = "protonaut";
     genericName = "Game launcher";
     comment = "Launch Windows games through umu-launcher";
     terminal = false;
-    exec = "umulaunch";
-    icon = "applications-games";
+    exec = "protonaut";
+    # Имя из темы: пакеты кладут знак в share/icons/hicolor, рабочий стол
+    # найдёт его сам и на 16 px, и на 512 px.
+    icon = "protonaut";
     categories = [
       "Game"
       "Utility"
     ];
-    startupWMClass = "umulaunch";
+    startupWMClass = "protonaut";
   };
 in
 rustPlatform.buildRustPackage {
-  pname = "umulaunch";
+  pname = "protonaut";
   inherit version src;
 
-  cargoHash = "sha256-AYHlCOULevn0QaRxCg3cg+RtXCzwxhG6eRD5f9fv7RA=";
+  cargoHash = "sha256-vfqpgAJBCDttG8NmzWqFzF72dZUkwgsYWboiviJ4pME=";
 
   nativeBuildInputs = [
     pkg-config
@@ -94,10 +109,19 @@ rustPlatform.buildRustPackage {
   doCheck = true;
 
   postInstall = ''
-    install -D ${desktopItem}/share/applications/umulaunch.desktop \
-      $out/share/applications/umulaunch.desktop
+    install -D ${desktopItem}/share/applications/protonaut.desktop \
+      $out/share/applications/protonaut.desktop
 
-    wrapProgram $out/bin/umulaunch \
+    # hicolor по размерам + scalable: панель задач берёт 16–32, меню — 48,
+    # ретина — 256, а SVG нужен для любого остального масштаба.
+    for size in ${lib.concatStringsSep " " iconSizes}; do
+      install -Dm644 assets/hicolor/$size/apps/protonaut.png \
+        $out/share/icons/hicolor/$size/apps/protonaut.png
+    done
+    install -Dm644 assets/protonaut.svg \
+      $out/share/icons/hicolor/scalable/apps/protonaut.svg
+
+    wrapProgram $out/bin/protonaut \
       --prefix LD_LIBRARY_PATH : "${runtimePath}:/run/opengl-driver/lib" \
       --prefix PATH : ${lib.makeBinPath [ umu-launcher ]}
   '';
@@ -120,7 +144,7 @@ rustPlatform.buildRustPackage {
     '';
     license = lib.licenses.mit;
     platforms = lib.platforms.linux;
-    mainProgram = "umulaunch";
+    mainProgram = "protonaut";
     # maintainer = [ ];  # заполнить при подаче в nixpkgs
   };
 }

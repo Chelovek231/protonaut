@@ -23,7 +23,7 @@ use iced::{
 };
 use serde::{Deserialize, Serialize};
 
-const APP: &str = "umulaunch";
+const APP: &str = "protonaut";
 const STORES: [&str; 6] = ["none", "heroic", "gog", "epicgames", "legendary", "other"];
 
 // Палитра. Тема одна, светлого варианта нет — цвета можно держать константами.
@@ -56,12 +56,43 @@ fn theme() -> Theme {
     )
 }
 
+/// Значок из PNG, вшитого в бинарник: декодим сами, потому что feature
+/// `image` у iced тянет AVIF-декодер (rav1e с rayon) ради одной картинки.
+/// Не RGBA или битый файл — просто значит «без значка», окно от этого не
+/// перестаёт открываться.
+fn window_icon(data: &[u8]) -> Option<iced::window::Icon> {
+    let mut reader = png::Decoder::new(std::io::Cursor::new(data))
+        .read_info()
+        .ok()?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    iced::window::icon::from_rgba(buf, info.width, info.height).ok()
+}
+
+/// Настройки окна: знак из `assets/` как `_NET_WM_ICON` (в X11 без него в
+/// панели висит заглушка) и `application_id`, совпадающий с basename
+/// `.desktop` — по нему рабочий стол находит иконку и класс окна на Wayland.
+fn window() -> iced::window::Settings {
+    iced::window::Settings {
+        icon: window_icon(include_bytes!("../assets/hicolor/64x64/apps/protonaut.png")),
+        platform_specific: iced::window::settings::PlatformSpecific {
+            application_id: APP.to_string(),
+            ..Default::default()
+        },
+        ..iced::window::Settings::default()
+    }
+}
+
 fn main() -> iced::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(cli) = Cli::parse(&args) {
         return cli.run();
     }
     iced::application(State::new, update, view)
+        .window(window())
         .title(APP)
         .theme(theme())
         .subscription(subscription)
@@ -88,10 +119,10 @@ enum Cli {
 }
 
 const USAGE: &str = "\
-umulaunch — запуск Windows-игр через umu-launcher
+protonaut — запуск Windows-игр через umu-launcher
 
 Без аргументов открывает окно (Wayland). Конфиг ищется в порядке
-$UMULAUNCH_CONFIG, $XDG_CONFIG_HOME/umulaunch/config.toml.
+$PROTONAUT_CONFIG, $XDG_CONFIG_HOME/protonaut/config.toml.
 
 Флаги:
   --list             игры из конфига с развёрнутыми значениями
@@ -127,7 +158,7 @@ $UMULAUNCH_CONFIG, $XDG_CONFIG_HOME/umulaunch/config.toml.
   [game.env]
   \"<ПЕРЕМЕННАЯ>\" = \"<значение>\"
 
-Логи игр: $XDG_STATE_HOME/umulaunch/<имя-игры>.log\n";
+Логи игр: $XDG_STATE_HOME/protonaut/<имя-игры>.log\n";
 
 impl Cli {
     fn parse(args: &[String]) -> Option<Self> {
@@ -144,7 +175,7 @@ impl Cli {
             "--proton-install" => {
                 let tag = args.get(1).cloned().unwrap_or_default();
                 if tag.is_empty() {
-                    eprintln!("нужен тег релиза: umulaunch --proton-install \"GE-Proton…\"");
+                    eprintln!("нужен тег релиза: protonaut --proton-install \"GE-Proton…\"");
                     std::process::exit(2);
                 }
                 Some(Cli::ProtonInstall(tag))
@@ -152,7 +183,7 @@ impl Cli {
             "--dry-run" | "--launch" => {
                 let name = args.get(1).cloned().unwrap_or_default();
                 if name.is_empty() {
-                    eprintln!("нужно имя игры: umulaunch {flag} \"<имя игры>\"");
+                    eprintln!("нужно имя игры: protonaut {flag} \"<имя игры>\"");
                     std::process::exit(2);
                 }
                 Some(if flag == "--dry-run" {
@@ -176,7 +207,7 @@ impl Cli {
                 return Ok(());
             }
             Cli::Version => {
-                println!("umulaunch {}", env!("CARGO_PKG_VERSION"));
+                println!("protonaut {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             // загрузка Proton не зависит от конфига: сломанный config.toml
@@ -1036,7 +1067,7 @@ fn none_if_empty(s: &str) -> Option<String> {
 // ---------------------------------------------------------------- paths and files
 
 fn config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("UMULAUNCH_CONFIG") {
+    if let Ok(p) = std::env::var("PROTONAUT_CONFIG") {
         return expand(&p);
     }
     let dir = dirs::config_dir()
@@ -1055,7 +1086,7 @@ fn config_path() -> PathBuf {
 
 fn log_dir() -> PathBuf {
     dirs::state_dir()
-        .unwrap_or_else(|| PathBuf::from(".umulaunch"))
+        .unwrap_or_else(|| PathBuf::from(".protonaut"))
         .join(APP)
 }
 
@@ -2364,7 +2395,7 @@ fn install_release(rel: &Release, prog: &DlProgress) -> Result<PathBuf, String> 
             ));
         }
     }
-    let tmp = target.join(format!(".umulaunch-{}", rel.tag));
+    let tmp = target.join(format!(".protonaut-{}", rel.tag));
     let _ = std::fs::remove_dir_all(&tmp);
     let result = install_into(&tmp, rel, prog);
     let _ = std::fs::remove_dir_all(&tmp);
@@ -2424,7 +2455,7 @@ fn proton_install(tag: &str) {
         }
     };
     let Some(release) = releases.into_iter().find(|r| r.tag == tag) else {
-        eprintln!("нет такой версии: {tag} — посмотрите umulaunch --proton-list");
+        eprintln!("нет такой версии: {tag} — посмотрите protonaut --proton-list");
         std::process::exit(1);
     };
     let progress = Arc::new(DlProgress::default());
@@ -4479,7 +4510,7 @@ DXVK_HUD = "compiler"
 
     #[test]
     fn plan_is_one_copy_pasteable_shell_line() {
-        let dir = std::env::temp_dir().join(format!("umulaunch-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("protonaut-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("временный каталог");
         let exe = dir.join("My Game.exe");
         std::fs::write(&exe, b"MZ").expect("мнимый .exe");
@@ -4635,7 +4666,7 @@ DXVK_HUD = "compiler"
 
     #[test]
     fn dialog_starts_at_the_nearest_existing_folder() {
-        let dir = std::env::temp_dir().join(format!("umulaunch-start-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("protonaut-start-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("deep")).expect("каталог");
         let file = dir.join("deep/game.exe");
@@ -4878,7 +4909,7 @@ DXVK_HUD = "compiler"
             h2.set_size(bad.len() as u64);
             h2.set_mode(0o644);
             h2.set_entry_type(EntryType::Regular);
-            h2.set_path_absolute("/umulaunch-escape")
+            h2.set_path_absolute("/protonaut-escape")
                 .expect("путь в заголовке");
             h2.set_cksum();
             ar.append(&h2, &mut bad).expect("запись добавлена");
@@ -4889,7 +4920,7 @@ DXVK_HUD = "compiler"
 
     #[test]
     fn unpack_installs_runner_and_blocks_escapes() {
-        let dir = std::env::temp_dir().join(format!("umulaunch-unpack-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("protonaut-unpack-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("временный каталог");
         let prog = DlProgress::default();
@@ -4907,7 +4938,7 @@ DXVK_HUD = "compiler"
         let err = unpack(&evil, &out, &prog).expect_err("путь наружу нельзя принять");
         assert!(err.contains("вне папки установки"), "{err}");
         assert!(
-            !out.join("umulaunch-escape").exists(),
+            !out.join("protonaut-escape").exists(),
             "запись всё же раскрылась"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4917,7 +4948,7 @@ DXVK_HUD = "compiler"
     fn cancelled_download_stops_before_write() {
         let prog = DlProgress::default();
         prog.cancel();
-        let dir = std::env::temp_dir().join(format!("umulaunch-cancel-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("protonaut-cancel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("временный каталог");
         // локальный сервер тут не нужен: обрыв проверяется на распаковке
@@ -4934,14 +4965,14 @@ DXVK_HUD = "compiler"
 
     #[test]
     fn removable_runner_is_only_a_real_folder_of_the_install_dir() {
-        let dir = std::env::temp_dir().join(format!("umulaunch-remove-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("protonaut-remove-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("GE-Proton0-0")).expect("каталог раннера");
         std::fs::write(dir.join("GE-Proton0-0/proton"), "#!/bin/sh\n").expect("proton");
         std::fs::create_dir_all(dir.join("not_a_runner")).expect("пустой каталог");
         let outside = dir
             .join("..")
-            .join(format!("umulaunch-outside-{}", std::process::id()));
+            .join(format!("protonaut-outside-{}", std::process::id()));
         std::fs::create_dir_all(outside.join("GE-Proton0-1")).expect("внешний каталог");
         std::fs::write(outside.join("GE-Proton0-1/proton"), "#!/bin/sh\n").expect("proton снаружи");
         std::os::unix::fs::symlink(outside.join("GE-Proton0-1"), dir.join("link"))
@@ -4967,5 +4998,33 @@ DXVK_HUD = "compiler"
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn shipped_icons_are_rgba_and_fit_their_hicolor_dir() {
+        for size in [
+            "16x16", "24x24", "32x32", "48x48", "64x64", "128x128", "256x256", "512x512",
+        ] {
+            let path = format!("assets/hicolor/{size}/apps/protonaut.png");
+            let mut reader =
+                png::Decoder::new(std::io::Cursor::new(std::fs::read(&path).expect(&path)))
+                    .read_info()
+                    .expect(&path);
+            let mut buf = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).expect(&path);
+            let (w, h) = size.split_once('x').unwrap();
+            assert_eq!(info.color_type, png::ColorType::Rgba, "{path}");
+            assert_eq!(info.bit_depth, png::BitDepth::Eight, "{path}");
+            assert_eq!(
+                (info.width, info.height),
+                (w.parse().unwrap(), h.parse().unwrap()),
+                "{path} не совпадает с именем каталога"
+            );
+        }
+
+        assert!(
+            window_icon(include_bytes!("../assets/hicolor/64x64/apps/protonaut.png")).is_some(),
+            "окно без значка — в панели будет заглушка"
+        );
     }
 }

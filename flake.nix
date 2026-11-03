@@ -1,5 +1,5 @@
 {
-  description = "umulaunch — GUI-лаунчер игр поверх umu-launcher (чистый Wayland, iced)";
+  description = "protonaut — GUI-лаунчер игр поверх umu-launcher (чистый Wayland, iced)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -12,7 +12,7 @@
       systems = [ "x86_64-linux" ];
 
       flake.nixosModules.default = { pkgs, ... }: {
-        environment.systemPackages = [ self.packages.${pkgs.system}.umulaunch ];
+        environment.systemPackages = [ self.packages.${pkgs.system}.protonaut ];
       };
 
       perSystem =
@@ -23,20 +23,21 @@
           ...
         }:
         {
-          packages.umulaunch = pkgs.callPackage ./nix/package.nix {
+          packages.protonaut = pkgs.callPackage ./nix/package.nix {
             src = lib.fileset.toSource {
               root = ./.;
               fileset = lib.fileset.unions [
                 ./Cargo.toml
                 ./Cargo.lock
                 ./src
+                ./assets
                 ./README.md
                 ./LICENSE
               ];
             };
           };
 
-          packages.default = config.packages.umulaunch;
+          packages.default = config.packages.protonaut;
 
           # cargo build без Nix: пути dlopen-библиотек берутся из пакета
           devShells.default = pkgs.mkShell {
@@ -64,7 +65,7 @@
               ]
               ++ [ pkgs.umu-launcher ];
             shellHook = ''
-              export LD_LIBRARY_PATH=/run/opengl-driver/lib:${config.packages.umulaunch.passthru.runtimePath}
+              export LD_LIBRARY_PATH=/run/opengl-driver/lib:${config.packages.protonaut.passthru.runtimePath}
             '';
           };
 

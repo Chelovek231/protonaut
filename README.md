@@ -1,4 +1,4 @@
-# umulaunch
+# protonaut
 
 Небольшой GUI-лаунчер для Linux (чистый Wayland, [iced](https://github.com/iced-rs/iced)),
 который запускает Windows-игры через [umu-launcher](https://github.com/ValveSoftware/umu-launcher):
@@ -11,8 +11,8 @@
 где её увидят Steam, Lutris и сам лаунчер (см. «Загрузка Proton»).
 
 ```
-┌ umulaunch ─────────────────────────────────────────────────────────┐
-│ ▶ umulaunch [umu-run]   [Proton] [перечитать] [сохранить] [новая]  │
+┌ protonaut ─────────────────────────────────────────────────────────┐
+│ ▶ protonaut [umu-run]   [Proton] [перечитать] [сохранить] [новая]  │
 ├─ по умолчанию ─────────────────────────────────────────────────────┤
 │ раннер · STORE · umu-run · префиксы · папки раннеров   [свернуть]  │
 ├─ Игры                       ┬─ Карточка игры                       ┤
@@ -25,6 +25,35 @@
 └─ umu-run · игр · запущено   ┴─ Ctrl+S · Ctrl+R · Ctrl+Q · Esc      ┘
 ```
 
+## Название и значок
+
+**protonaut** — «про тон» как космический полёт: тот же корень, но вместо
+«запускалки» обещание прокатиться. Прежнее имя (`umulaunch`) было именем
+инструмента, а не программы, и совпадало с пакетом umu-launcher, из-за чего в
+`PATH`, в логах и в меню было два почти одинаковых соседа.
+
+Значок — плоский знак: тёмная плитка, орбита с двумя электронами и треугольник
+пуска. Исходник векторный ([`assets/protonaut.svg`](assets/protonaut.svg)), поэтому
+он чистый по лицензии (для подачи в nixpkgs это важно) и не мылится на ретине.
+На 16 и 24 пикселах орбита исчезает — там она превращается в кашу, — и остаётся
+только пуск с точкой ([`assets/protonaut-tiny.svg`](assets/protonaut-tiny.svg));
+с 32 пикселей — вариант с утолщённым кольцом.
+
+Что куда попадает:
+
+- `share/icons/hicolor/<размер>/apps/protonaut.png` (16/24/32/48/64/128/256/512) и
+  `scalable/apps/protonaut.svg` — их берёт меню приложений и панель задач;
+- `share/applications/protonaut.desktop` с `Icon=protonaut` и
+  `StartupWMClass=protonaut`;
+- сам `protonaut.png` 64×64 вшит в бинарник и уходит в `_NET_WM_ICON`, поэтому
+  значок виден и в окне, даже когда тема иконок его не нашла; `application_id`
+  на Wayland совпадает с basename ярлыка, иначе рабочий стол не связывает окно
+  с иконкой.
+
+Переименование ничего не мигрирует само — из старых имён читается только
+`games.toml`. Старую библиотеку достаточно переложить один раз:
+`mv ~/.config/umulaunch ~/.config/protonaut`.
+
 ## Установка
 
 ### NixOS (модуль из flake)
@@ -34,15 +63,15 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    umulaunch.url = "github:ВАШ/umulaunch";
+    protonaut.url = "github:ВАШ/protonaut";
   };
 
-  outputs = { nixpkgs, umulaunch, ... }: {
+  outputs = { nixpkgs, protonaut, ... }: {
     nixosConfigurations.ИМЯ = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
       modules = [
         ./configuration.nix
-        umulaunch.nixosModules.default
+        protonaut.nixosModules.default
       ];
     };
   };
@@ -53,12 +82,12 @@
 Обёртка бинарника кладёт `umu-launcher` в `PATH` и все dlopen-библиотеки
 (`libGL`, `vulkan-loader`, `libxkbcommon`, Wayland) в `LD_LIBRARY_PATH`, поэтому
 `umu-run` ставить отдельно не нужно. В меню приложений появляется ярлык
-`umulaunch.desktop` (`share/applications`).
+`protonaut.desktop` (`share/applications`).
 
 Пакет также можно поставить в профиле пользователя:
 
 ```bash
-nix profile install github:ВАШ/umulaunch
+nix profile install github:ВАШ/protonaut
 ```
 
 ### Непакетная сборка
@@ -76,14 +105,14 @@ cargo build --release      # нужен pkg-config и системные биб�
 `fetchFromGitHub`:
 
 ```nix
-# pkgs/by-name/um/umulaunch/package.nix
+# pkgs/by-name/pr/protonaut/package.nix
 { lib, fetchFromGitHub, ... }:
 rustPlatform.buildRustPackage rec {
-  pname = "umulaunch";
+  pname = "protonaut";
   version = "0.1.0";
   src = fetchFromGitHub {
     owner = "ВАШ";
-    repo = "umulaunch";
+    repo = "protonaut";
     rev = "v${version}";
     hash = "sha256-…";
   };
@@ -96,11 +125,11 @@ rustPlatform.buildRustPackage rec {
 
 Файл ищется в порядке:
 
-1. `$UMULAUNCH_CONFIG` (переменная окружения, полный путь к TOML);
-2. `$XDG_CONFIG_HOME/umulaunch/config.toml` (обычно `~/.config/umulaunch/config.toml`);
-3. `$XDG_CONFIG_HOME/umulaunch/games.toml` — старое имя, читается, если нового нет.
+1. `$PROTONAUT_CONFIG` (переменная окружения, полный путь к TOML);
+2. `$XDG_CONFIG_HOME/protonaut/config.toml` (обычно `~/.config/protonaut/config.toml`);
+3. `$XDG_CONFIG_HOME/protonaut/games.toml` — старое имя, читается, если нового нет.
 
-Логи игр: `$XDG_STATE_HOME/umulaunch/<имя-игры>.log`.
+Логи игр: `$XDG_STATE_HOME/protonaut/<имя-игры>.log`.
 
 Значение `~` разворачивается в `$HOME` в любом пути, так что конфиг переносим между
 машинами и не привязан к одному пользователю.
@@ -222,7 +251,7 @@ umu-launcher (обычно это `proton-ge` или `wine-ge` из своих �
   предупреждает и ставит как есть;
 - до начала загрузки проверяется, что целевой каталог свободен с трёхкратным запасом,
   а такого раннера там ещё нет;
-- распаковка идёт в `<каталог>/.umulaunch-<ТЕГ>` и только потом переименовывается в
+- распаковка идёт в `<каталог>/.protonaut-<ТЕГ>` и только потом переименовывается в
   итоговое имя, так что полускачанный или побитый Proton не может стать раннером.
   Пути внутри архива проверяются: абсолютные пути и `..`, уводящие наружу, отвергаются,
   как и симлинки, указывающие за пределы каталога установки;
@@ -304,14 +333,14 @@ Ctrl+R.
 ## Терминал
 
 ```bash
-umulaunch --help              # флаги и схема конфига
-umulaunch --version           # версия
-umulaunch --list              # что видно в конфиге и как разворачиваются значения
-umulaunch --runners           # найденные раннеры
-umulaunch --dry-run "<имя>"   # команда запуска, ничего не стартует
-umulaunch --launch "<имя>"    # запустить и ждать выхода (для скриптов)
-umulaunch --proton-list       # доступные GE-Proton (нужна сеть)
-umulaunch --proton-install "<ТЕГ>"   # скачать, сверить хеш, установить
+protonaut --help              # флаги и схема конфига
+protonaut --version           # версия
+protonaut --list              # что видно в конфиге и как разворачиваются значения
+protonaut --runners           # найденные раннеры
+protonaut --dry-run "<имя>"   # команда запуска, ничего не стартует
+protonaut --launch "<имя>"    # запустить и ждать выхода (для скриптов)
+protonaut --proton-list       # доступные GE-Proton (нужна сеть)
+protonaut --proton-install "<ТЕГ>"   # скачать, сверить хеш, установить
 ```
 
 Имя игры можно задавать частично: хватит подстроки, точное совпадение приоритетнее.
@@ -336,7 +365,7 @@ Esc, и по своей отмене).
 nix develop                                  # cargo/rustc + пути для dlopen
 cargo run                                    # GUI прямо из дерева
 cargo test                                   # конфиг, слаг, аргументы, кавычки, дерево процессов
-nix build .#umulaunch && ./result/bin/umulaunch   # проверка готовой обёртки
+nix build .#protonaut && ./result/bin/protonaut   # проверка готовой обёртки
 nix fmt flake.nix nix/package.nix
 ```
 
@@ -346,7 +375,9 @@ nix fmt flake.nix nix/package.nix
 ## Зависимости
 
 Во время сборки: `pkg-config`, библиотеки-разработки alsa/fontconfig/wayland, а из
-crate-зависимостей — `iced`, `serde`/`toml`, `dirs`, `libc` и стек загрузки
+crate-зависимостей — `iced` (без feature `image`: она тянет AVIF-декодер ради одной
+иконки, поэтому PNG читает `png`), `serde`/`toml`, `dirs`, `libc`, `ashpd`
+(системный диалог выбора пути) и стек загрузки
 (`ureq` с корнями webpki — системные CA не нужны, что для NixOS важно — `serde_json`,
 `flate2`, `tar`, `sha2`, `tokio` для фоновых задач).
 Во время работы: `libGL`/`vulkan-loader`/`libxkbcommon` (окно), X11-клиентские
