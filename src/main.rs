@@ -412,6 +412,18 @@ impl fmt::Display for Runner {
     }
 }
 
+/// Ссылка конфига (`~/` разрешено) указывает на этот каталог. Сравнение с
+/// канонизацией нужно потому, что Steam-каталог обычно виден по двум путям
+/// сразу: `~/.local/share/Steam/…` и `~/.steam/steam/…`.
+fn points_at(r: Option<&str>, path: &Path) -> bool {
+    r.is_some_and(|p| {
+        Runner {
+            path: Some(p.to_string()),
+        }
+        .same(path.to_path_buf())
+    })
+}
+
 // ---------------------------------------------------------------- runtime state
 
 struct Game {
@@ -652,6 +664,13 @@ enum Message {
     DlCancel,
     DlListed(Result<Vec<Release>, String>),
     DlDone(Result<PathBuf, String>),
+    /// Первая кнопка удаления версии: показать подтверждение с именем.
+    DlAskRemove(String),
+    /// Подтверждённое удаление установленной версии.
+    DlRemove(String),
+    /// Раздумали удалять.
+    DlCancelRemove,
+    DlRemoved(Result<String, String>),
     /// Клавиатурные события нужны для Ctrl+S / Ctrl+R / Esc.
     Key(keyboard::Event),
 }
@@ -686,6 +705,10 @@ struct State {
     /// Куда разложен последний установленный раннер — по нему предлагают
     /// сделать раннер по умолчанию.
     dl_last: Option<PathBuf>,
+    /// Версия, удаление которой подтверждают повторной кнопкой.
+    dl_confirm: Option<String>,
+    /// Версия, каталог которой удаляется прямо сейчас.
+    dl_removing: Option<String>,
     dl_error: Option<String>,
     /// Карточка параметров по умолчанию развёрнута: она съедает треть окна,
     /// а правят её редко.
@@ -717,6 +740,8 @@ impl State {
             dl_job: None,
             dl_installed: installed_runners(&proton_install_dir()),
             dl_last: None,
+            dl_confirm: None,
+            dl_removing: None,
             dl_error: None,
             settings_open: true,
         };
@@ -1429,6 +1454,47 @@ fn installed_runners(dir: &Path) -> Vec<String> {
     names.sort();
     names.reverse();
     names
+}
+
+/// Каталог установленной версии, который лаунчеру можно удалить: только папка
+/// с именем без разделителей, только обычная папка (не симлинк на чужой
+/// раздел), и только та, где внутри лежит исполняемый `proton`. Нативный Proton
+/// Steam живёт в `steamapps/common`, куда лаунчер не лезет: его удаляет Steam.
+fn removable_runner(dir: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err("удалить можно только папку из каталога установки".to_string());
+    }
+    let path = dir.join(name);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.file_type().is_dir() {
+        return Err(format!(
+            "{name} — не папка (симлинк или файл). Удаляйте её сами, лаунчер за \
+             каталог установки не выходит"
+        ));
+    }
+    if runner_at(&path).is_none() {
+        return Err(format!("в {name} нет исполняемого proton — это не раннер"));
+    }
+    Ok(path)
+}
+
+/// Удаление разворачиваем в тот же blocking-пул, что и установку: снять
+/// полгигабайта мелочи — это секунды, за которые окно не должно замереть.
+async fn remove_task(name: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let path = removable_runner(&proton_install_dir(), &name)?;
+        std::fs::remove_dir_all(&path)
+            .map_err(|e| format!("не удалить {}: {e}", path.display()))?;
+        Ok(name)
+    })
+    .await
+    .map_err(|e| format!("удаление прервано: {e}"))?
 }
 
 /// Каталог раннера может называться не тегом, а тегом с суффиксом архитектуры:
@@ -2436,6 +2502,7 @@ fn dl_update(state: &mut State, message: &Message) -> Option<Task<Message>> {
             }
             state.dl_open = !state.dl_open;
             state.dl_error = None;
+            state.dl_confirm = None;
             if state.dl_open && state.dl_releases.is_empty() && state.dl_job.is_none() {
                 state.dl_status = DlStatus::Listing;
                 return Some(Task::perform(list_task(), Message::DlListed));
@@ -2533,6 +2600,79 @@ fn dl_update(state: &mut State, message: &Message) -> Option<Task<Message>> {
                 Err(e) => {
                     state.dl_error = Some(e.clone());
                 }
+            }
+            None
+        }
+        Message::DlAskRemove(name) => {
+            state.dl_error = None;
+            if state.dl_job.is_some() || state.dl_removing.is_some() {
+                state.dl_error = Some("дождитесь конца установки или удаления".to_string());
+                return None;
+            }
+            let path = proton_install_dir().join(name);
+            let busy = state.games.iter().find(|g| {
+                g.child.is_some()
+                    && points_at(
+                        g.cfg.runner.as_deref().or(state.defaults.runner.as_deref()),
+                        &path,
+                    )
+            });
+            if let Some(game) = busy {
+                state.dl_confirm = None;
+                state.dl_error = Some(format!(
+                    "«{}» запущена на этой версии — сначала остановите её",
+                    game.cfg.name
+                ));
+                return None;
+            }
+            state.dl_confirm = Some(name.clone());
+            None
+        }
+        // Удаляем только по повторному нажатию: имя в прошлый раз могло
+        // относиться к другой строке списка.
+        Message::DlRemove(name) if state.dl_confirm.as_deref() == Some(name.as_str()) => {
+            state.dl_confirm = None;
+            state.dl_removing = Some(name.clone());
+            Some(Task::perform(remove_task(name.clone()), Message::DlRemoved))
+        }
+        Message::DlRemove(_) => None,
+        Message::DlCancelRemove => {
+            state.dl_confirm = None;
+            None
+        }
+        Message::DlRemoved(result) => {
+            state.dl_removing = None;
+            match result {
+                Ok(name) => {
+                    let path = proton_install_dir().join(name);
+                    state.dl_installed = installed_runners(&proton_install_dir());
+                    state.runners = discover_runners(&split_dirs(&state.runner_dirs_input));
+                    if state.dl_last.as_deref() == Some(path.as_path()) {
+                        state.dl_last = None;
+                    }
+                    // Ссылка на удалённый каталог в конфиге была бы битой:
+                    // убираем её, игра уедет на «авто».
+                    let mut freed = 0usize;
+                    for g in &mut state.games {
+                        if points_at(g.cfg.runner.as_deref(), &path) {
+                            g.cfg.runner = None;
+                            freed += 1;
+                        }
+                    }
+                    if points_at(state.defaults.runner.as_deref(), &path) {
+                        state.defaults.runner = None;
+                        freed += 1;
+                    }
+                    state.notice = Some(format!(
+                        "{name} удалена{}",
+                        if freed == 0 {
+                            String::new()
+                        } else {
+                            format!("; {freed} запис(ы) переведены на «авто» — сохраните (Ctrl+S)")
+                        }
+                    ));
+                }
+                Err(e) => state.dl_error = Some(e.clone()),
             }
             None
         }
@@ -2784,6 +2924,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         state.dl_open = false;
                     }
                     state.confirm_delete = None;
+                    state.dl_confirm = None;
                 }
                 _ => {}
             }
@@ -2796,7 +2937,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         | Message::DlInstall
         | Message::DlCancel
         | Message::DlListed(_)
-        | Message::DlDone(_) => {}
+        | Message::DlDone(_)
+        | Message::DlAskRemove(_)
+        | Message::DlRemove(_)
+        | Message::DlCancelRemove
+        | Message::DlRemoved(_) => {}
     }
     Task::none()
 }
@@ -4046,17 +4191,56 @@ fn dl_body(state: &State) -> Element<'_, Message> {
                 },
             )),
     );
+    let busy = state.dl_job.is_some() || state.dl_removing.is_some();
+    let mut list = Column::with_capacity(state.dl_installed.len()).spacing(4);
+    for name in &state.dl_installed {
+        let removing = state.dl_removing.as_deref() == Some(name.as_str());
+        let confirming = state.dl_confirm.as_deref() == Some(name.as_str());
+        let mut row = Row::with_capacity(3)
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .push(
+                text(name.clone())
+                    .size(11)
+                    .color(TEXT)
+                    .width(Length::Fill)
+                    .wrapping(text::Wrapping::Word),
+            );
+        if removing {
+            row = row.push(chip("удаляем…", PRIMARY));
+        } else if confirming {
+            row = row
+                .push(
+                    button(text(format!("удалить {name}")).size(11))
+                        .padding([4, 10])
+                        .style(danger_style)
+                        .on_press(Message::DlRemove(name.clone())),
+                )
+                .push(mini("отмена", Message::DlCancelRemove));
+        } else {
+            row = row.push(
+                button(text("удалить").size(11))
+                    .padding([4, 10])
+                    .style(ghost_style)
+                    .on_press_maybe((!busy).then_some(Message::DlAskRemove(name.clone()))),
+            );
+        }
+        list = list.push(row);
+    }
     col = col.push(
-        container(
-            text(if state.dl_installed.is_empty() {
-                "пока ничего".to_string()
-            } else {
-                state.dl_installed.join(" · ")
-            })
-            .size(11)
-            .color(TEXT)
-            .wrapping(text::Wrapping::WordOrGlyph),
-        )
+        container(if state.dl_installed.is_empty() {
+            Column::with_capacity(1).push(text("пока ничего").size(11).color(TEXT))
+        } else {
+            Column::with_capacity(2).spacing(6).push(list).push(
+                text(
+                    "удаляем только эти папки: Proton, который поставил сам Steam, \
+                             снимает Steam, лаунчер в steamapps/common не заходит.",
+                )
+                .size(10)
+                .color(MUTED)
+                .wrapping(text::Wrapping::Word),
+            )
+        })
         .padding(10)
         .width(Length::Fill)
         .style(sunken_style),
@@ -4746,5 +4930,42 @@ DXVK_HUD = "compiler"
             "установка прервана"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removable_runner_is_only_a_real_folder_of_the_install_dir() {
+        let dir = std::env::temp_dir().join(format!("umulaunch-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("GE-Proton0-0")).expect("каталог раннера");
+        std::fs::write(dir.join("GE-Proton0-0/proton"), "#!/bin/sh\n").expect("proton");
+        std::fs::create_dir_all(dir.join("not_a_runner")).expect("пустой каталог");
+        let outside = dir
+            .join("..")
+            .join(format!("umulaunch-outside-{}", std::process::id()));
+        std::fs::create_dir_all(outside.join("GE-Proton0-1")).expect("внешний каталог");
+        std::fs::write(outside.join("GE-Proton0-1/proton"), "#!/bin/sh\n").expect("proton снаружи");
+        std::os::unix::fs::symlink(outside.join("GE-Proton0-1"), dir.join("link"))
+            .expect("симлинк на чужую папку");
+
+        assert_eq!(
+            removable_runner(&dir, "GE-Proton0-0").expect("свой раннер удаляем"),
+            dir.join("GE-Proton0-0")
+        );
+        assert!(
+            removable_runner(&dir, "not_a_runner").is_err(),
+            "без proton не раннер"
+        );
+        assert!(
+            removable_runner(&dir, "link").is_err(),
+            "симлинк наружу не наш"
+        );
+        for name in ["", ".", "..", "../etc", "a/b", "GE-Proton0-0\\.."] {
+            assert!(
+                removable_runner(&dir, name).is_err(),
+                "«{name}» принято быть не должно"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
