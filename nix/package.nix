@@ -72,7 +72,7 @@ rustPlatform.buildRustPackage {
   pname = "umulaunch";
   inherit version src;
 
-  cargoHash = "sha256-ZPtg3uaLG8jjmhr5JmBRxZT0/UjPkzaqNSXu0wvpGt8=";
+  cargoHash = "sha256-AYHlCOULevn0QaRxCg3cg+RtXCzwxhG6eRD5f9fv7RA=";
 
   nativeBuildInputs = [
     pkg-config

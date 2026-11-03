@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use ashpd::PortalError;
+use ashpd::desktop::ResponseError;
+use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
 use iced::border::Radius;
 use iced::keyboard::{self, Modifiers};
 use iced::widget::{
@@ -431,10 +434,10 @@ struct Draft {
     env: String,
 }
 
-/// Какое поле лаунчера заполняет выбор пути. Файловые цели показывают ещё и
-/// файлы, каталожные — только каталоги.
+/// Какое поле лаунчера заполняет системный диалог. Файловые цели показывают ещё
+/// и файлы, каталожные — только каталоги.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BrowseTarget {
+enum PickTarget {
     DraftExe,
     DraftPrefix,
     PrefixRoot,
@@ -443,7 +446,7 @@ enum BrowseTarget {
     ScanDir,
 }
 
-impl BrowseTarget {
+impl PickTarget {
     fn title(self) -> &'static str {
         match self {
             Self::DraftExe => "исполняемый файл .exe",
@@ -458,15 +461,6 @@ impl BrowseTarget {
     fn wants_file(self) -> bool {
         matches!(self, Self::DraftExe | Self::UmuRun)
     }
-}
-
-/// Открытый выбор пути: где стоим и чем фильтруем содержимое.
-#[derive(Debug, Clone)]
-struct Browse {
-    target: BrowseTarget,
-    path: PathBuf,
-    filter: String,
-    error: Option<String>,
 }
 
 /// Релиз GE-Proton, пригодный к установке на этой машине: архив нужной
@@ -647,15 +641,10 @@ enum Message {
     DlToggle,
     /// Свернуть/развернуть карточку параметров по умолчанию.
     SettingsToggle,
-    /// Открыть выбор пути для поля.
-    Browse(BrowseTarget),
-    BrowseCancel,
-    /// Зайти в каталог / подняться на уровень выше.
-    BrowseEnter(PathBuf),
-    BrowseUp,
-    BrowseFilter(String),
-    /// Выбранный путь уходит в поле, обзор закрывается.
-    BrowsePick(PathBuf),
+    /// Открыть системный диалог выбора пути для поля.
+    Pick(PickTarget),
+    /// Ответ портала: путь, отмена или ошибка.
+    Picked(PickTarget, Result<Option<PathBuf>, String>),
     /// Опросить GitHub и показать список версий.
     DlList,
     DlChosen(Release),
@@ -701,9 +690,6 @@ struct State {
     /// Карточка параметров по умолчанию развёрнута: она съедает треть окна,
     /// а правят её редко.
     settings_open: bool,
-    /// Открытый выбор пути: занимает правую панель, пока не выберут или не
-    /// отменят (Esc).
-    browse: Option<Browse>,
 }
 
 impl State {
@@ -733,7 +719,6 @@ impl State {
             dl_last: None,
             dl_error: None,
             settings_open: true,
-            browse: None,
         };
         state.reload();
         // Конфиг с играми означает «параметры уже настроены»: сворачиваем
@@ -849,58 +834,50 @@ impl State {
         result
     }
 
-    /// Открываем обзор над текущим значением поля, чтобы не вбивать путь руками.
-    fn open_browse(&mut self, target: BrowseTarget) {
-        let value = match target {
-            BrowseTarget::DraftExe => self
+    /// Текущее значение поля, для которого открыли диалог: по нему портал
+    /// стартует в нужную папку, а не в домашний каталог.
+    fn pick_value(&self, target: PickTarget) -> String {
+        match target {
+            PickTarget::DraftExe => self
                 .draft
                 .as_ref()
                 .map(|d| d.exe.clone())
                 .unwrap_or_default(),
-            BrowseTarget::DraftPrefix => self
+            PickTarget::DraftPrefix => self
                 .draft
                 .as_ref()
                 .map(|d| d.prefix.clone())
                 .unwrap_or_default(),
-            BrowseTarget::PrefixRoot => self.prefix_root_input.clone(),
-            BrowseTarget::UmuRun => self.umu_input.clone(),
+            PickTarget::PrefixRoot => self.prefix_root_input.clone(),
+            PickTarget::UmuRun => self.umu_input.clone(),
             // В поле список через «;»: стартуем с последней папки.
-            BrowseTarget::RunnerDirs => split_dirs(&self.runner_dirs_input)
+            PickTarget::RunnerDirs => split_dirs(&self.runner_dirs_input)
                 .pop()
                 .unwrap_or_default(),
-            BrowseTarget::ScanDir => self.scan_dir.clone(),
-        };
-        self.browse = Some(Browse {
-            target,
-            path: start_dir(&value),
-            filter: String::new(),
-            error: None,
-        });
+            PickTarget::ScanDir => self.scan_dir.clone(),
+        }
     }
 
-    /// Выбранный путь уходит в поле, которое открыло обзор.
-    fn apply_browse(&mut self, path: PathBuf) {
-        let Some(browse) = self.browse.take() else {
-            return;
-        };
+    /// Выбранный путь уходит в поле, которое открыло диалог.
+    fn apply_pick(&mut self, target: PickTarget, path: PathBuf) {
         let text = path.display().to_string();
-        match browse.target {
-            BrowseTarget::DraftExe => {
+        match target {
+            PickTarget::DraftExe => {
                 if let Some(d) = self.draft.as_mut() {
                     d.exe = text;
                 }
             }
-            BrowseTarget::DraftPrefix => {
+            PickTarget::DraftPrefix => {
                 if let Some(d) = self.draft.as_mut() {
                     d.prefix = text;
                 }
             }
-            BrowseTarget::PrefixRoot => self.prefix_root_input = text,
-            BrowseTarget::UmuRun => {
+            PickTarget::PrefixRoot => self.prefix_root_input = text,
+            PickTarget::UmuRun => {
                 self.umu_input = text;
                 self.umu = expand(&self.umu_input);
             }
-            BrowseTarget::RunnerDirs => {
+            PickTarget::RunnerDirs => {
                 let mut dirs = split_dirs(&self.runner_dirs_input);
                 if !dirs.iter().any(|d| expand(d) == path) {
                     dirs.push(text);
@@ -908,7 +885,7 @@ impl State {
                 self.runner_dirs_input = dirs.join("; ");
                 self.runners = discover_runners(&dirs);
             }
-            BrowseTarget::ScanDir => self.scan_dir = text,
+            PickTarget::ScanDir => self.scan_dir = text,
         }
     }
 
@@ -1098,17 +1075,14 @@ fn split_dirs(s: &str) -> Vec<String> {
         .collect()
 }
 
-// ---------------------------------------------------------------- browsing
+// ------------------------------------------------------------ path picking
 //
-// iced не даёт нативного диалога выбора пути, а звать zenity или портал —
-// значит добавить лаунчеру рантайм-зависимость от чужого GUI. Список каталога
-// показываем сами: этого хватает всем полям, где нужен путь.
+// Обзор пути — системный диалог, который рисует портал рабочего стола
+// (org.freedesktop.portal.FileChooser): тот же window-picker, что у остальных
+// приложений, с закладками, поиском и вводом пути. Лаунчер сам ничего не
+// перечитывает и своего «проводника» не показывает.
 
-/// Сколько записей показываем: в /usr/share их тысячи, и по кнопке на запись
-/// превращают обзор в тормоз. Дальше спасает фильтр.
-const BROWSE_LIMIT: usize = 400;
-
-/// С чего начинать обзор: ближайшее существующее каталога значения поля. Если
+/// С чего начинать диалог: ближайшее существующее каталога значения поля. Если
 /// путь указывает на файл — заходим в его каталог.
 fn start_dir(value: &str) -> PathBuf {
     let p = expand(value.trim());
@@ -1128,55 +1102,98 @@ fn start_dir(value: &str) -> PathBuf {
     }
 }
 
-/// Содержимое каталога для обзора: сначала папки, затем файлы (если цель —
-/// файл), по имени без учёта регистра.
-fn browse_listing(
-    dir: &Path,
-    filter: &str,
-    files: bool,
-) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
-    let read = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let needle = filter.trim().to_lowercase();
-    let mut dirs = Vec::new();
-    let mut found = Vec::new();
-    for entry in read.flatten() {
-        let p = entry.path();
-        if !needle.is_empty()
-            && !p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.to_lowercase().contains(&needle))
-        {
-            continue;
-        }
-        if p.is_dir() {
-            dirs.push(p);
-        } else if files {
-            found.push(p);
-        }
+/// Фильтры диалога: список того, что вообще стоит выбирать в этом поле. Для
+/// каталогов фильтров нет — портал и так показывает только папки.
+fn pick_filters(target: PickTarget) -> Vec<FileFilter> {
+    match target {
+        PickTarget::DraftExe => vec![
+            FileFilter::new("Windows-программы").glob("*.exe"),
+            FileFilter::new("все файлы").glob("*"),
+        ],
+        PickTarget::UmuRun => vec![
+            FileFilter::new("umu-run").glob("umu-run"),
+            FileFilter::new("все файлы").glob("*"),
+        ],
+        _ => Vec::new(),
     }
-    let by_name = |v: &mut Vec<PathBuf>| {
-        v.sort_by(|a, b| {
-            // Скрытые точкими папки — в конец: иначе ~/Games и ~/SteamLibrary
-            // уезжают за первую экранную страницу из-за ~/.bun и ~/.cache.
-            hidden(a).cmp(&hidden(b)).then_with(|| {
-                a.file_name()
-                    .map(|n| n.to_string_lossy().to_lowercase())
-                    .cmp(&b.file_name().map(|n| n.to_string_lossy().to_lowercase()))
-            })
-        })
-    };
-    by_name(&mut dirs);
-    by_name(&mut found);
-    dirs.truncate(BROWSE_LIMIT);
-    found.truncate(BROWSE_LIMIT);
-    Ok((dirs, found))
 }
 
-/// Имя со скрытым признаком: true для «.что-то» — такие идут после обычных.
-fn hidden(p: &Path) -> bool {
-    p.file_name()
-        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+/// Открыть системный диалог и дождаться ответа. Ok(None) — путь не выбран,
+/// это не ошибка и в поле ничего не идёт.
+async fn pick_path(target: PickTarget, start: PathBuf) -> Result<Option<PathBuf>, String> {
+    let request = SelectedFiles::open_file()
+        .title(target.title())
+        .directory(!target.wants_file())
+        .filters(pick_filters(target))
+        .current_folder(&start)
+        .map_err(|e| format!("не показать каталог {}: {e}", start.display()))?;
+    // send() сам ждёт сигнал Response: диалог открыт, ответ получен — остаётся
+    // только разобрать, что на нём прислали.
+    let answer = match request.send().await {
+        Ok(sent) => sent.response(),
+        Err(e) => Err(e),
+    };
+    let files = match answer {
+        Ok(files) => files,
+        Err(e) if is_declined(&e) => return Ok(None),
+        Err(e) => return Err(portal_error(e)),
+    };
+    Ok(files.uris().first().and_then(|u| uri_to_path(u.as_str())))
+}
+
+/// Путь не выбран: отмена, закрытое окно диалога или «другая ошибка» фронтенда,
+/// которая у gtk/kde означает именно то, что человек ушёл из диалога, ничего не
+/// выбрав. Ошибкой это быть не должно — иначе красное окно за обычное Esc.
+fn is_declined(e: &ashpd::Error) -> bool {
+    matches!(
+        e,
+        ashpd::Error::Response(ResponseError::Cancelled | ResponseError::Other)
+            | ashpd::Error::Portal(PortalError::Cancelled(_) | PortalError::WindowDestroyed(_))
+    )
+}
+
+/// Что сказать, когда диалог не открылся. Обычно это отсутствие портала, и
+/// именно его человек ищет в списке пакетов.
+fn portal_error(e: ashpd::Error) -> String {
+    match &e {
+        ashpd::Error::PortalNotFound(name) => format!(
+            "системного диалога нет: интерфейс {name} ни одному сервису не \
+             принадлежит. нужны запущенный xdg-desktop-portal и его frontend \
+             (gtk, kde или hyprland)"
+        ),
+        _ => format!("системный диалог не открылся: {e}"),
+    }
+}
+
+/// Путь из file:// URI, которую вернул портал: схема, затем абсолютный путь,
+/// пробелы и не-ASCII — в percent-encoding.
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let path = uri.strip_prefix("file://")?;
+    // «file:///home/…» — пустой хост, путь начинается сразу после схемы. Хост в
+    // file:// — это чужая машина, такого лаунчер не откроет.
+    if !path.starts_with('/') {
+        return None;
+    }
+    percent_decode(path).map(PathBuf::from)
+}
+
+/// Раскодирование percent-encoding в UTF-8: байты после %XX, целыми группами.
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = char::from(bytes[i + 1]).to_digit(16)?;
+            let lo = char::from(bytes[i + 2]).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 fn split_args(s: &str) -> Vec<String> {
@@ -2560,31 +2577,21 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Quit => return quit(state),
         Message::New => state.open_draft(None),
         Message::SettingsToggle => state.settings_open = !state.settings_open,
-        Message::Browse(target) => state.open_browse(target),
-        Message::BrowseCancel => state.browse = None,
-        Message::BrowseEnter(path) => {
-            if let Some(b) = state.browse.as_mut() {
-                b.path = path.clone();
-                b.filter.clear();
-                b.error = None;
-            }
+        Message::Pick(target) => {
+            // Диалог рисует портал, поэтому он асинхронный: ждём ответ в фоновой
+            // задаче, а окно лаунчера остаётся живым.
+            let start = start_dir(&state.pick_value(target));
+            return Task::perform(pick_path(target, start), move |answer| {
+                Message::Picked(target, answer)
+            });
         }
-        Message::BrowseUp => {
-            if let Some(b) = state.browse.as_mut().filter(|b| b.path.parent().is_some()) {
-                b.path = b
-                    .path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or(b.path.clone());
-                b.filter.clear();
-            }
+        Message::Picked(target, Ok(Some(path))) => {
+            state.apply_pick(target, path);
+            state.error = None;
         }
-        Message::BrowseFilter(s) => {
-            if let Some(b) = state.browse.as_mut() {
-                b.filter = s;
-            }
-        }
-        Message::BrowsePick(path) => state.apply_browse(path),
+        // Отмена диалога — не ошибка: поле остаётся как было.
+        Message::Picked(_, Ok(None)) => {}
+        Message::Picked(_, Err(e)) => state.error = Some(e),
         Message::Start(i) => {
             let (umu, defaults) = (state.umu.clone(), state.defaults.clone());
             if let Some(game) = state.games.get_mut(i)
@@ -2769,11 +2776,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 // Ctrl+Q — тот же путь, что и крестик окна: сначала запись, потом выход.
                 Key::Character(c) if cmd && c.eq_ignore_ascii_case("q") => return quit(state),
                 Key::Named(iced::keyboard::key::Named::Escape) => {
-                    // Esc закрывает то, что открыто последним: обзор, карточку,
-                    // потом панель загрузок.
-                    if state.browse.is_some() {
-                        state.browse = None;
-                    } else if state.draft.is_some() {
+                    // Esc закрывает то, что открыто последним: карточку игры,
+                    // потом панель загрузок. Диалог портала закрывается сам.
+                    if state.draft.is_some() {
                         state.draft = None;
                     } else {
                         state.dl_open = false;
@@ -3212,13 +3217,13 @@ fn path_field<'a>(
     placeholder: &'static str,
     value: &'a str,
     msg: fn(String) -> Message,
-    target: BrowseTarget,
+    target: PickTarget,
 ) -> Row<'a, Message> {
     Row::with_capacity(2)
         .spacing(6)
         .align_y(Alignment::Center)
         .push(field(placeholder, value, msg).width(Length::Fill))
-        .push(mini("обзор", Message::Browse(target)))
+        .push(mini("обзор", Message::Pick(target)))
 }
 
 fn runner_pick<'a>(
@@ -3368,7 +3373,7 @@ fn view(state: &State) -> Column<'_, Message> {
                                 "<umu-run, пусто — искать в PATH>",
                                 &state.umu_input,
                                 Message::UmuRun,
-                                BrowseTarget::UmuRun,
+                                PickTarget::UmuRun,
                             ),
                             umu_label(&state.umu),
                         )
@@ -3386,7 +3391,7 @@ fn view(state: &State) -> Column<'_, Message> {
                                 "~/Games/umu",
                                 &state.prefix_root_input,
                                 Message::PrefixRoot,
-                                BrowseTarget::PrefixRoot,
+                                PickTarget::PrefixRoot,
                             ),
                             format!(
                                 "префиксы создаются в {}",
@@ -3402,7 +3407,7 @@ fn view(state: &State) -> Column<'_, Message> {
                                 "~/.local/share/proton-upstream",
                                 &state.runner_dirs_input,
                                 Message::RunnerDirs,
-                                BrowseTarget::RunnerDirs,
+                                PickTarget::RunnerDirs,
                             ),
                             format!(
                                 "дополнительных папок: {}",
@@ -3509,7 +3514,7 @@ fn view(state: &State) -> Column<'_, Message> {
                             "~/SteamLibrary",
                             &state.scan_dir,
                             Message::ScanDir,
-                            BrowseTarget::ScanDir,
+                            PickTarget::ScanDir,
                         )
                         .width(Length::Fill),
                     )
@@ -3533,9 +3538,7 @@ fn view(state: &State) -> Column<'_, Message> {
         .push(scan);
 
     // ---- правая колонка: карточка выбранного, затем лог
-    let right_body: Element<'_, Message> = if let Some(b) = &state.browse {
-        browse_view(b)
-    } else if let Some(d) = &state.draft {
+    let right_body: Element<'_, Message> = if let Some(d) = &state.draft {
         Column::with_capacity(20)
             .spacing(6)
             .push(label("имя — задаёт имя лога и GAMEID по умолчанию"))
@@ -3556,14 +3559,14 @@ fn view(state: &State) -> Column<'_, Message> {
                 "<путь к .exe>",
                 &d.exe,
                 Message::DraftExe,
-                BrowseTarget::DraftExe,
+                PickTarget::DraftExe,
             ))
             .push(label("wine-префикс"))
             .push(path_field(
                 "пусто → <корень префиксов>/<GAMEID>",
                 &d.prefix,
                 Message::DraftPrefix,
-                BrowseTarget::DraftPrefix,
+                PickTarget::DraftPrefix,
             ))
             .push(label("GAMEID и STORE"))
             .push(
@@ -3711,9 +3714,7 @@ fn view(state: &State) -> Column<'_, Message> {
         pane_empty(state)
     };
 
-    let pane_title = if state.browse.is_some() {
-        "выбор пути"
-    } else if state.draft.is_some() {
+    let pane_title = if state.draft.is_some() {
         "карточка игры"
     } else if state.dl_open {
         "загрузка Proton"
@@ -3856,120 +3857,6 @@ fn empty_state(state: &State) -> Element<'static, Message> {
     .padding([4, 10])
     .width(Length::Fill)
     .into()
-}
-
-/// Одна запись обзора: папка — переход, файл — выбор.
-fn browse_entry(
-    name: String,
-    path: PathBuf,
-    msg: fn(PathBuf) -> Message,
-) -> Element<'static, Message> {
-    button(text(name).size(12).width(Length::Fill))
-        .padding([6, 10])
-        .width(Length::Fill)
-        .style(ghost_style)
-        .on_press(msg(path))
-        .into()
-}
-
-/// Выбор пути внутри лаунчера: текущий каталог, фильтр, содержимое и кнопка
-/// «выбрать эту папку», когда цель — каталог.
-fn browse_view(b: &Browse) -> Element<'_, Message> {
-    let wants_file = b.target.wants_file();
-    let placeholder: &'static str = if wants_file {
-        "фильтр по имени файла"
-    } else {
-        "фильтр по имени папки"
-    };
-
-    let mut col = Column::with_capacity(6)
-        .spacing(8)
-        .push(browse_head(b, wants_file))
-        .push(
-            text_input(placeholder, &b.filter)
-                .on_input(Message::BrowseFilter)
-                .size(13)
-                .padding([7, 10]),
-        )
-        .push(label(b.target.title()));
-
-    match browse_listing(&b.path, &b.filter, wants_file) {
-        Ok((dirs, files)) => {
-            let shown = dirs.len() + files.len();
-            let truncated = dirs.len() >= BROWSE_LIMIT || files.len() >= BROWSE_LIMIT;
-            let mut list = Column::with_capacity(shown + 1).spacing(2);
-            if dirs.is_empty() && files.is_empty() {
-                list = list.push(
-                    container(
-                        text("здесь пусто — поправьте фильтр или поднимитесь вверх")
-                            .size(11)
-                            .color(MUTED),
-                    )
-                    .padding([6, 4]),
-                );
-            }
-            for dir in dirs {
-                let name = dir
-                    .file_name()
-                    .map(|n| format!("{}/", n.to_string_lossy()))
-                    .unwrap_or_else(|| dir.display().to_string());
-                list = list.push(browse_entry(name, dir, Message::BrowseEnter));
-            }
-            for file in files {
-                let name = file
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| file.display().to_string());
-                list = list.push(browse_entry(name, file, Message::BrowsePick));
-            }
-            col = col.push(list);
-            if truncated {
-                col = col.push(
-                    text(format!(
-                        "показаны первые {BROWSE_LIMIT} записей — уточните фильтром"
-                    ))
-                    .size(10)
-                    .color(MUTED),
-                );
-            }
-            if wants_file {
-                col = col.push(
-                    text("файл выбирается кликом; папка — переход внутрь")
-                        .size(10)
-                        .color(MUTED),
-                );
-            }
-        }
-        Err(e) => col = col.push(banner("✕", "не читается", e, DANGER)),
-    }
-
-    col.into()
-}
-
-/// Шапка обзора: куда смотрим, как подняться, и выбор текущей папки. Кнопку
-/// выбора держим здесь — под списком в сотни строк её не видно.
-fn browse_head(b: &Browse, wants_file: bool) -> Row<'_, Message> {
-    let mut head = Row::with_capacity(4)
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .push(mini("↑ вверх", Message::BrowseUp))
-        .push(
-            container(
-                text(b.path.display().to_string())
-                    .size(11)
-                    .color(TEXT)
-                    .width(Length::Fill)
-                    .wrapping(text::Wrapping::WordOrGlyph),
-            )
-            .width(Length::Fill),
-        );
-    if !wants_file {
-        head = head.push(action(
-            "выбрать эту папку",
-            Message::BrowsePick(b.path.clone()),
-        ));
-    }
-    head.push(mini("отмена", Message::BrowseCancel))
 }
 
 /// Правая панель без выбора: кнопки уже есть в списке слева, поэтому здесь
@@ -4504,40 +4391,66 @@ DXVK_HUD = "compiler"
     }
 
     #[test]
-    fn browse_listing_shows_folders_first_and_files_only_for_files() {
-        let dir = std::env::temp_dir().join(format!("umulaunch-browse-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("Proton 10.0")).expect("каталог");
-        std::fs::create_dir_all(dir.join("games")).expect("каталог");
-        std::fs::create_dir_all(dir.join(".cache")).expect("каталог");
-        std::fs::write(dir.join("run.exe"), b"MZ").expect("файл");
-
-        let (dirs, files) = browse_listing(&dir, "", false).expect("читается");
-        assert_eq!(files.len(), 0, "для каталожной цели файлы не показываются");
-        let names = dirs
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+    fn portal_uri_becomes_a_plain_path() {
         assert_eq!(
-            names,
-            ["games", "Proton 10.0", ".cache"],
-            "папки по имени без регистра, скрытые — после обычных"
+            uri_to_path("file:///home/user/Games/game.exe").unwrap(),
+            PathBuf::from("/home/user/Games/game.exe")
         );
-
-        let (dirs, files) = browse_listing(&dir, "run", true).expect("с фильтром");
-        assert!(dirs.is_empty(), "фильтр отсекает лишние папки");
-        assert_eq!(files.len(), 1);
-
-        let (dirs, files) = browse_listing(&dir, "", true).expect("файлы видны");
-        assert_eq!(dirs.len(), 3);
-        assert_eq!(files.len(), 1);
-
-        assert!(browse_listing(&dir.join("нет такого"), "", false).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        // портал присылает URI, поэтому пробел и кириллица приходят в
+        // percent-encoding: «/run/media/user/Диск 1/game.exe»
+        assert_eq!(
+            uri_to_path("file:///run/media/user/%D0%94%D0%B8%D1%81%D0%BA%201/game.exe").unwrap(),
+            PathBuf::from("/run/media/user/Диск 1/game.exe")
+        );
+        assert_eq!(
+            uri_to_path("file:///home/user/Games/Proton%2010.0/game.exe").unwrap(),
+            PathBuf::from("/home/user/Games/Proton 10.0/game.exe")
+        );
+        // чужой хост в file:// — это не локальный файл, лаунчер его не откроет
+        assert_eq!(uri_to_path("file://other/share/game.exe"), None);
+        assert_eq!(uri_to_path("https://example.com/game.exe"), None);
+        // битый percent-encoding остаётся ошибкой, а не мусорным путём
+        assert_eq!(uri_to_path("file:///tmp/%FF"), None);
+        // одинокий % — допустимое имя файла, оно и есть путь
+        assert_eq!(
+            uri_to_path("file:///tmp/%").unwrap(),
+            PathBuf::from("/tmp/%")
+        );
     }
 
     #[test]
-    fn browse_starts_at_the_nearest_existing_folder() {
+    fn only_file_targets_get_filters() {
+        let labels = pick_filters(PickTarget::DraftExe)
+            .iter()
+            .map(|f| f.label().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["Windows-программы", "все файлы"]);
+        assert_eq!(pick_filters(PickTarget::UmuRun).len(), 2);
+        // каталоги фильтрует сам портал: там выбор папки, а не файла
+        assert!(pick_filters(PickTarget::ScanDir).is_empty());
+        assert!(pick_filters(PickTarget::RunnerDirs).is_empty());
+        assert!(PickTarget::DraftExe.wants_file());
+        assert!(!PickTarget::DraftPrefix.wants_file());
+    }
+
+    #[test]
+    fn closing_the_dialog_is_not_an_error() {
+        assert!(is_declined(&ashpd::Error::Response(
+            ResponseError::Cancelled
+        )));
+        // gtk/kde сообщают «other», когда диалог закрыли без выбора
+        assert!(is_declined(&ashpd::Error::Response(ResponseError::Other)));
+        assert!(is_declined(&ashpd::Error::Portal(
+            PortalError::WindowDestroyed(String::new())
+        )));
+        // а вот отсутствие портала — настоящая ошибка, её надо показать
+        let e = ashpd::Error::IO(std::io::Error::other("нет dbus"));
+        assert!(!is_declined(&e));
+        assert!(portal_error(e).contains("системный диалог не открылся"));
+    }
+
+    #[test]
+    fn dialog_starts_at_the_nearest_existing_folder() {
         let dir = std::env::temp_dir().join(format!("umulaunch-start-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("deep")).expect("каталог");
