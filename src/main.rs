@@ -147,6 +147,7 @@ $PROTONAUT_CONFIG, $XDG_CONFIG_HOME/protonaut/config.toml.
   store = \"<none|heroic|gog|epicgames|legendary|other>\"
   prefix_root = \"~/Games/umu\"        # префиксы вида <prefix_root>/<GAMEID>
   runner_dirs = [\"<папка с раннерами>\"]
+  mangohud = true                    # обёрнуть запуск в mangohud (нет ключа = выключен)
   [[game]]
   name = \"<имя игры>\"                # обязательно
   exe = \"<путь к .exe>\"              # обязательно, ~/ разворачивается
@@ -154,6 +155,7 @@ $PROTONAUT_CONFIG, $XDG_CONFIG_HOME/protonaut/config.toml.
   prefix = \"<каталог префикса>\"      # пусто — <prefix_root>/<GAMEID>
   store = \"<store для игры>\"
   runner = \"<каталог Proton для игры>\"
+  mangohud = false                   # true/false для игры; нет ключа — как в [defaults]
   args = [\"<аргумент>\", \"<ещё>\"]
   [game.env]
   \"<ПЕРЕМЕННАЯ>\" = \"<значение>\"
@@ -248,27 +250,30 @@ impl Cli {
                 );
             }
             Cli::DryRun(name) => match find(&state.games, &name) {
-                Some((i, g)) => match plan(&g.cfg, &state.umu, &state.defaults) {
-                    Ok(desc) => {
-                        println!("# игра №{i}: {}", g.cfg.name);
-                        println!("{desc}");
+                Some((i, g)) => {
+                    match plan(&g.cfg, &state.umu, state.hud.as_deref(), &state.defaults) {
+                        Ok(desc) => {
+                            println!("# игра №{i}: {}", g.cfg.name);
+                            println!("{desc}");
+                        }
+                        Err(e) => {
+                            eprintln!("{e}");
+                            std::process::exit(1);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("{e}");
-                        std::process::exit(1);
-                    }
-                },
+                }
                 None => not_found(&name),
             },
             Cli::Launch(name) => match find(&state.games, &name).map(|(i, _)| i) {
                 Some(i) => {
                     let (umu, defaults) = (state.umu.clone(), state.defaults.clone());
+                    let hud = state.hud.clone();
                     let log = state.games[i].log.clone();
-                    if let Ok(desc) = plan(&state.games[i].cfg, &umu, &defaults) {
+                    if let Ok(desc) = plan(&state.games[i].cfg, &umu, hud.as_deref(), &defaults) {
                         println!("# игра №{i}: {}", state.games[i].cfg.name);
                         println!("{desc}");
                     }
-                    match launch(&state.games[i], &umu, &defaults) {
+                    match launch(&state.games[i], &umu, hud.as_deref(), &defaults) {
                         Ok(mut child) => {
                             println!("запущено — лог {}", log.display());
                             // в терминале ждать ребёнка напрямую: так скрипт получает
@@ -382,6 +387,9 @@ struct Defaults {
     /// Дополнительные каталоги, где искать раннеры.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     runner_dirs: Vec<String>,
+    /// Оборачивать запуск в `mangohud` для всех игр сразу.
+    #[serde(default, skip_serializing_if = "is_false")]
+    mangohud: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -398,8 +406,58 @@ struct GameCfg {
     store: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     args: Vec<String>,
+    /// Some(true) — включать MangoHud даже если по умолчанию выключен,
+    /// Some(false) — не включать даже если по умолчанию включён.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mangohud: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     env: BTreeMap<String, String>,
+}
+
+/// MangoHud у отдельной игры: наследует то, что в `[defaults]`, либо спорит с ним.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Hud {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl Hud {
+    const ALL: [Hud; 3] = [Hud::Auto, Hud::On, Hud::Off];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "как в настройках",
+            Self::On => "включить",
+            Self::Off => "выключить",
+        }
+    }
+
+    fn from_cfg(value: Option<bool>) -> Self {
+        match value {
+            None => Self::Auto,
+            Some(true) => Self::On,
+            Some(false) => Self::Off,
+        }
+    }
+
+    fn to_cfg(self) -> Option<bool> {
+        match self {
+            Self::Auto => None,
+            Self::On => Some(true),
+            Self::Off => Some(false),
+        }
+    }
+
+    /// Что получится после применения настроек по умолчанию.
+    fn acts(self, defaults_on: bool) -> bool {
+        match self {
+            Self::Auto => defaults_on,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
 }
 
 /// Раннер: path=None — «пусть umu-launcher сам решает» (обычно Proton-UMU).
@@ -475,6 +533,7 @@ struct Draft {
     store: String,
     args: String,
     env: String,
+    hud: Hud,
 }
 
 /// Какое поле лаунчера заполняет системный диалог. Файловые цели показывают ещё
@@ -667,6 +726,8 @@ enum Message {
     Scan,
     DefaultRunner(Runner),
     DefaultStore(String),
+    /// MangoHud для всех игр сразу.
+    DefaultHud(bool),
     PrefixRoot(String),
     UmuRun(String),
     RunnerDirs(String),
@@ -678,6 +739,7 @@ enum Message {
     DraftRunner(Runner),
     DraftArgs(String),
     DraftEnv(String),
+    DraftHud(Hud),
     Commit,
     Cancel,
     /// Панель загрузки Proton: открыть/закрыть.
@@ -713,6 +775,8 @@ struct State {
     warn: Option<String>,
     umu: PathBuf,
     umu_input: String,
+    /// Найденный `mangohud`: None — обёртки в системе нет, и включать её нечем.
+    hud: Option<PathBuf>,
     defaults: Defaults,
     prefix_root_input: String,
     runner_dirs_input: String,
@@ -755,6 +819,7 @@ impl State {
             warn: None,
             umu: PathBuf::from("umu-run"),
             umu_input: String::new(),
+            hud: found_binary("mangohud"),
             defaults: Defaults::default(),
             prefix_root_input: "~/Games/umu".to_string(),
             runner_dirs_input: String::new(),
@@ -796,6 +861,7 @@ impl State {
                 self.warn = None;
                 self.umu = umu;
                 self.umu_input = config.umu_run.clone().unwrap_or_default();
+                self.hud = found_binary("mangohud");
                 self.defaults = config.defaults.clone();
                 self.prefix_root_input = config
                     .defaults
@@ -858,6 +924,7 @@ impl State {
                 store: self.defaults.store.clone(),
                 prefix_root: none_if_empty(&self.prefix_root_input),
                 runner_dirs: split_dirs(&self.runner_dirs_input),
+                mangohud: self.defaults.mangohud,
             },
             game: self.games.iter().map(|g| g.cfg.clone()).collect(),
         }
@@ -954,6 +1021,7 @@ impl State {
                 prefix: g.cfg.prefix.clone().unwrap_or_default(),
                 gameid: g.cfg.gameid.clone().unwrap_or_default(),
                 store: g.cfg.store.clone().unwrap_or_else(|| "none".into()),
+                hud: Hud::from_cfg(g.cfg.mangohud),
                 args: g.cfg.args.join(" "),
                 env: g
                     .cfg
@@ -1005,6 +1073,7 @@ impl State {
             gameid: none_if_empty(&draft.gameid),
             store: none_if_empty(&draft.store),
             args: split_args(&draft.args),
+            mangohud: draft.hud.to_cfg(),
             env: parse_env(&draft.env),
         };
         match editing {
@@ -1062,6 +1131,12 @@ fn none_if_empty(s: &str) -> Option<String> {
     } else {
         Some(t.to_string())
     }
+}
+
+/// `skip_serializing_if` для bool-настройки: выключенное состояние — это
+/// отсутствие ключа, а не `mangohud = false` в каждом конфиге.
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 // ---------------------------------------------------------------- paths and files
@@ -1309,24 +1384,45 @@ fn load() -> Result<(Config, PathBuf), String> {
 }
 
 fn which_umu() -> PathBuf {
+    which_binary("umu-run")
+}
+
+/// Обёртки (`umu-run`, `mangohud`) ищем одинаково: сначала типовые места
+/// установки, потом PATH. Если не нашли — возвращаем просто имя: в сообщении
+/// об ошибке оно читается понятнее, чем пустая строка.
+fn which_binary(name: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    for cand in [
-        PathBuf::from("/run/current-system/sw/bin/umu-run"),
-        PathBuf::from("/usr/local/bin/umu-run"),
-        PathBuf::from("/usr/bin/umu-run"),
-        PathBuf::from(format!("{home}/.local/bin/umu-run")),
+    let local = format!("{home}/.local/bin");
+    for dir in [
+        "/run/current-system/sw/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        &local,
     ] {
+        let cand = PathBuf::from(dir).join(name);
         if cand.exists() {
             return cand;
         }
     }
     for entry in std::env::var("PATH").unwrap_or_default().split(':') {
-        let cand = PathBuf::from(entry).join("umu-run");
+        let cand = PathBuf::from(entry).join(name);
         if cand.exists() {
             return cand;
         }
     }
-    PathBuf::from("umu-run")
+    PathBuf::from(name)
+}
+
+/// Включать ли этой игре MangoHud: своя галка важнее того, что по умолчанию.
+fn hud_enabled(cfg: &GameCfg, defaults: &Defaults) -> bool {
+    Hud::from_cfg(cfg.mangohud).acts(defaults.mangohud)
+}
+
+/// Найденный обёртка-бинарник или None. `which_binary` возвращает имя даже
+/// когда ничего нет, а обёртке нужно различать «не нашли» и «не просили».
+fn found_binary(name: &str) -> Option<PathBuf> {
+    let path = which_binary(name);
+    path.exists().then_some(path)
 }
 
 /// Каталог из поиска раннеров. `game_dir` — папка с установленными играми
@@ -1667,10 +1763,29 @@ fn shq(s: &str) -> String {
 fn build_command(
     cfg: &GameCfg,
     umu: &Path,
+    hud: Option<&Path>,
     defaults: &Defaults,
 ) -> Result<(Command, String), String> {
     let (exe, prefix, gameid, store, runner) = resolve(cfg, defaults)?;
-    let mut cmd = Command::new(umu);
+    // `mangohud <обёртка> <игра>`: скрипт mangohud добавляет LD_PRELOAD и
+    // Vulkan-слой; MANGOHUD=1 без него ничего не включает.
+    let hud_on = hud_enabled(cfg, defaults);
+    let hud_path = if hud_on {
+        Some(hud.ok_or_else(|| {
+            "mangohud не найден — поставьте пакет mangohud или выключите его в карточке игры"
+                .to_string()
+        })?)
+    } else {
+        None
+    };
+    let mut cmd = match hud_path {
+        Some(h) => {
+            let mut c = Command::new(h);
+            c.arg(umu);
+            c
+        }
+        None => Command::new(umu),
+    };
     cmd.arg(&exe).args(&cfg.args);
     if let Some(dir) = exe.parent() {
         cmd.current_dir(dir);
@@ -1730,13 +1845,17 @@ fn build_command(
     };
     // Одна строка, которую можно вставить в терминал: cd в каталог игры, переменные
     // окружения, затем umu-run с путём к .exe.
+    let wrapper = hud_path
+        .map(|h| format!("{} ", shq(&h.display().to_string())))
+        .unwrap_or_default();
     let desc = format!(
-        "cd {} && {} {} {}{}",
+        "cd {} && {} {}{} {}{}",
         shq(&exe
             .parent()
             .map(|d| d.display().to_string())
             .unwrap_or_else(|| ".".into())),
         pairs,
+        wrapper,
         shq(&umu.display().to_string()),
         shq(&exe.display().to_string()),
         args,
@@ -1744,8 +1863,13 @@ fn build_command(
     Ok((cmd, desc))
 }
 
-fn plan(cfg: &GameCfg, umu: &Path, defaults: &Defaults) -> Result<String, String> {
-    build_command(cfg, umu, defaults).map(|(_, desc)| desc)
+fn plan(
+    cfg: &GameCfg,
+    umu: &Path,
+    hud: Option<&Path>,
+    defaults: &Defaults,
+) -> Result<String, String> {
+    build_command(cfg, umu, hud, defaults).map(|(_, desc)| desc)
 }
 
 /// umu-run → proton → wineserver/wine: `kill` только прямому ребёнку оставляет
@@ -1802,14 +1926,19 @@ fn ppid_of(pid: u32) -> Option<u32> {
     rest.split_whitespace().nth(1)?.parse().ok()
 }
 
-fn launch(game: &Game, umu: &Path, defaults: &Defaults) -> Result<Child, String> {
+fn launch(
+    game: &Game,
+    umu: &Path,
+    hud: Option<&Path>,
+    defaults: &Defaults,
+) -> Result<Child, String> {
     if !umu.exists() {
         return Err(format!(
             "umu-run не найден: {} — поставьте umu-launcher или пропишите umu_run в конфиге",
             umu.display()
         ));
     }
-    let (mut cmd, _) = build_command(&game.cfg, umu, defaults)?;
+    let (mut cmd, _) = build_command(&game.cfg, umu, hud, defaults)?;
     if let Ok((_, prefix, ..)) = resolve(&game.cfg, defaults) {
         std::fs::create_dir_all(&prefix)
             .map_err(|e| format!("префикс {}: {e}", prefix.display()))?;
@@ -1824,8 +1953,11 @@ fn launch(game: &Game, umu: &Path, defaults: &Defaults) -> Result<Child, String>
     let out = open(&game.log)?;
     let err = open(&game.log)?;
     cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
+    // При обёртке запускаем не umu-run, а mangohud — называть в ошибке нужно
+    // то, что реально не смог стартовать.
+    let program = cmd.get_program().to_string_lossy().into_owned();
     cmd.spawn()
-        .map_err(|e| format!("не смог запустить {}: {e}", umu.display()))
+        .map_err(|e| format!("не смог запустить {program}: {e}"))
 }
 
 // ---------------------------------------------------------------- library scan
@@ -2729,8 +2861,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         | Message::DraftRunner(_)
         | Message::DraftArgs(_)
         | Message::DraftEnv(_)
+        | Message::DraftHud(_)
         | Message::DefaultRunner(_)
-        | Message::DefaultStore(_) => {}
+        | Message::DefaultStore(_)
+        | Message::DefaultHud(_) => {}
         _ => {
             state.notice = None;
             state.warn = None;
@@ -2764,12 +2898,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::Picked(_, Ok(None)) => {}
         Message::Picked(_, Err(e)) => state.error = Some(e),
         Message::Start(i) => {
-            let (umu, defaults) = (state.umu.clone(), state.defaults.clone());
+            let (umu, hud, defaults) = (
+                state.umu.clone(),
+                state.hud.clone().or_else(|| found_binary("mangohud")),
+                state.defaults.clone(),
+            );
             if let Some(game) = state.games.get_mut(i)
                 && game.child.is_none()
             {
                 state.error = None;
-                match launch(game, &umu, &defaults) {
+                match launch(game, &umu, hud.as_deref(), &defaults) {
                     Ok(child) => {
                         game.exit = None;
                         game.started = Some(Instant::now());
@@ -2882,6 +3020,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             state.ensure_runner(&r.path);
         }
         Message::DefaultStore(s) => state.defaults.store = Some(s),
+        Message::DefaultHud(on) => {
+            state.defaults.mangohud = on;
+            if on && state.hud.is_none() {
+                state.warn = Some(
+                    "mangohud не найден в PATH: по умолчанию он включён, но запуск соберётся только после установки пакета"
+                        .to_string(),
+                );
+            }
+        }
         Message::PrefixRoot(s) => state.prefix_root_input = s,
         Message::UmuRun(s) => {
             state.umu_input = s;
@@ -2932,6 +3079,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         Message::DraftEnv(s) => {
             if let Some(d) = state.draft.as_mut() {
                 d.env = s
+            }
+        }
+        Message::DraftHud(mode) => {
+            if let Some(d) = state.draft.as_mut() {
+                d.hud = mode
             }
         }
         Message::Commit => state.apply_draft(),
@@ -3226,15 +3378,49 @@ fn mini<'a>(title: &'a str, message: Message) -> Element<'a, Message> {
         .into()
 }
 
+/// Сегмент переключателя: активный подсвечен, остальные ждут нажатия.
+fn seg<'a>(title: &'a str, message: Message, active: bool) -> Element<'a, Message> {
+    button(text(title).size(11))
+        .padding([6, 11])
+        .style(toggle_style(active))
+        .on_press(message)
+        .into()
+}
+
+/// Три позиции MangoHud у отдельной игры.
+fn hud_seg(current: Hud, msg: fn(Hud) -> Message) -> Row<'static, Message> {
+    Hud::ALL.iter().fold(
+        Row::with_capacity(Hud::ALL.len()).spacing(6),
+        |row, mode| row.push(seg(mode.label(), msg(*mode), *mode == current)),
+    )
+}
+
+/// Где лежит обёртка mangohud и чем её настроить — под переключателем HUD,
+/// чтобы «включить и получить ноль» было видно заранее.
+fn hud_hint(hud: &Option<PathBuf>) -> String {
+    match hud {
+        Some(p) => format!(
+            "обёртка: {} · настройки ~/.config/MangoHud/MangoHud.conf, скрыть HUD — Shift_R+F12",
+            p.display()
+        ),
+        None => "обёртка mangohud не найдена: с включённым HUD запуск не соберётся, пока не поставите пакет".to_string(),
+    }
+}
+
 /// Что действует по умолчанию, одной строкой — так карточку видно, даже
 /// когда она свёрнута.
 fn settings_summary(state: &State) -> String {
     format!(
-        "раннер: {} · store: {} · префиксы: {} · umu-run: {}",
+        "раннер: {} · store: {} · префиксы: {} · umu-run: {} · MangoHud: {}",
         state.defaults.runner.as_deref().unwrap_or("авто"),
         state.defaults.store.as_deref().unwrap_or("none"),
         state.prefix_root_input,
         umu_label(&state.umu),
+        if state.defaults.mangohud {
+            "включён"
+        } else {
+            "выключен"
+        },
     )
 }
 
@@ -3593,6 +3779,22 @@ fn view(state: &State) -> Column<'_, Message> {
                         .width(Length::Fill),
                     ),
             )
+            .push(labeled_hint(
+                "MangoHud для всех игр",
+                Row::with_capacity(2)
+                    .spacing(6)
+                    .push(seg(
+                        "выключен",
+                        Message::DefaultHud(false),
+                        !state.defaults.mangohud,
+                    ))
+                    .push(seg(
+                        "включён",
+                        Message::DefaultHud(true),
+                        state.defaults.mangohud,
+                    )),
+                hud_hint(&state.hud),
+            ))
             .into()
     } else {
         // свёрнутая карточка не должна выглядеть сломанной: показываем, что сейчас действует
@@ -3767,6 +3969,25 @@ fn view(state: &State) -> Column<'_, Message> {
             .push(runner_pick(&state.runners, &d.runner, Message::DraftRunner))
             .push(label("переменные окружения K=V;K=V"))
             .push(field("PROTON_LOG=1;WINEESYNC=1", &d.env, Message::DraftEnv))
+            .push(label("MangoHud для этой игры"))
+            .push(
+                Row::with_capacity(2)
+                    .spacing(10)
+                    .align_y(Alignment::Center)
+                    .push(hud_seg(d.hud, Message::DraftHud))
+                    .push(
+                        text(format!(
+                            "действует: {}",
+                            if d.hud.acts(state.defaults.mangohud) {
+                                "включён"
+                            } else {
+                                "выключен"
+                            }
+                        ))
+                        .size(10)
+                        .color(MUTED),
+                    ),
+            )
             .push(hairline())
             .push(
                 Row::with_capacity(3)
@@ -3781,7 +4002,7 @@ fn view(state: &State) -> Column<'_, Message> {
     } else if state.dl_open {
         dl_body(state)
     } else if let Some(cfg) = state.selected_cfg() {
-        let ready = plan(cfg, &state.umu, &state.defaults).is_ok();
+        let ready = plan(cfg, &state.umu, state.hud.as_deref(), &state.defaults).is_ok();
         let mut col = Column::with_capacity(14).spacing(7).push(
             Row::with_capacity(2)
                 .spacing(10)
@@ -3864,6 +4085,20 @@ fn view(state: &State) -> Column<'_, Message> {
                     .join("; "),
             ));
         }
+        // Про HUD молчим только когда он нигде не включён: игрок должен видеть,
+        // будет обёртка в команде или нет.
+        if hud_enabled(cfg, &state.defaults) || cfg.mangohud.is_some() {
+            col = col.push(kv(
+                "MangoHud",
+                if !hud_enabled(cfg, &state.defaults) {
+                    "выключен для этой игры"
+                } else if cfg.mangohud.is_some() {
+                    "включён для этой игры"
+                } else {
+                    "включён по умолчанию"
+                },
+            ));
+        }
         col = col.push(
             Column::with_capacity(2)
                 .spacing(4)
@@ -3872,10 +4107,12 @@ fn view(state: &State) -> Column<'_, Message> {
                 ))
                 .push(
                     container(
-                        text(match plan(cfg, &state.umu, &state.defaults) {
-                            Ok(desc) => desc,
-                            Err(e) => format!("не готово к запуску: {e}"),
-                        })
+                        text(
+                            match plan(cfg, &state.umu, state.hud.as_deref(), &state.defaults) {
+                                Ok(desc) => desc,
+                                Err(e) => format!("не готово к запуску: {e}"),
+                            },
+                        )
                         .size(11)
                         .color(TEXT)
                         .wrapping(text::Wrapping::WordOrGlyph),
@@ -4449,6 +4686,7 @@ runner = "~/.local/share/Steam/compatibilitytools.d/proton-upstream"
 store = "none"
 prefix_root = "~/Games/umu"
 runner_dirs = ["~/.local/share/lutris/runners/proton"]
+mangohud = true
 
 [[game]]
 name = "My Game"
@@ -4456,6 +4694,7 @@ exe = "~/Games/MyGame/MyGame.exe"
 gameid = "um-my-game"
 prefix = "~/Games/umu/um-my-game"
 args = ["-windowed"]
+mangohud = false
 
 [game.env]
 DXVK_HUD = "compiler"
@@ -4468,12 +4707,99 @@ DXVK_HUD = "compiler"
             ["~/.local/share/lutris/runners/proton"]
         );
         assert_eq!(cfg.game[0].env.len(), 1);
+        assert!(cfg.defaults.mangohud);
+        assert_eq!(cfg.game[0].mangohud, Some(false));
         let back = toml::to_string_pretty(&cfg).expect("сериализуется");
         let again: Config = toml::from_str(&back).expect("читается обратно");
         assert_eq!(again.game[0].name, "My Game");
         assert_eq!(again.game[0].exe, cfg.game[0].exe);
         assert_eq!(again.defaults.runner, cfg.defaults.runner);
         assert_eq!(again.game[0].prefix, cfg.game[0].prefix);
+        assert!(again.defaults.mangohud);
+        assert_eq!(again.game[0].mangohud, Some(false));
+    }
+
+    /// Настоящий файл: `resolve` проверяет, что .exe существует.
+    fn temp_exe(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("protonaut-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("временный каталог");
+        let exe = dir.join("My Game.exe");
+        std::fs::write(&exe, b"MZ").expect("мнимый .exe");
+        exe
+    }
+
+    fn game_with(exe: &Path, hud: Option<bool>) -> GameCfg {
+        GameCfg {
+            name: "My Game".into(),
+            exe: exe.display().to_string(),
+            mangohud: hud,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mangohud_wraps_only_when_asked() {
+        let exe = temp_exe("hud");
+        let umu = Path::new("umu-run");
+        let hud = Path::new("/run/current-system/sw/bin/mangohud");
+        let on = Defaults {
+            mangohud: true,
+            ..Default::default()
+        };
+        let cfg = game_with(&exe, None);
+
+        let plain = plan(&cfg, umu, Some(hud), &Defaults::default()).expect("без HUD");
+        assert!(
+            !plain.contains("mangohud"),
+            "обёртка приехала сама: {plain}"
+        );
+        let wrapped = plan(&cfg, umu, Some(hud), &on).expect("по умолчанию");
+        assert!(
+            wrapped.contains("mangohud umu-run"),
+            "обёртки нет там, где её включили: {wrapped}"
+        );
+        // Игра спорит с настройками в обе стороны.
+        let off = plan(&game_with(&exe, Some(false)), umu, Some(hud), &on).expect("игра против");
+        assert!(!off.contains("mangohud"), "игра просила выключить: {off}");
+        let forced = plan(
+            &game_with(&exe, Some(true)),
+            umu,
+            Some(hud),
+            &Defaults::default(),
+        )
+        .expect("игра за");
+        assert!(
+            forced.contains("mangohud umu-run"),
+            "игра просит включить: {forced}"
+        );
+    }
+
+    #[test]
+    fn mangohud_without_wrapper_is_an_error() {
+        let exe = temp_exe("hud-missing");
+        let cfg = game_with(&exe, Some(true));
+        let e = plan(&cfg, Path::new("umu-run"), None, &Defaults::default())
+            .expect_err("без обёртки план собираться не должен");
+        assert!(
+            e.contains("mangohud"),
+            "в ошибке нет слова про обёртку: {e}"
+        );
+    }
+
+    #[test]
+    fn hud_state_is_not_written_when_off() {
+        let raw = toml::to_string_pretty(&Config::default()).expect("пустой конфиг");
+        assert!(
+            !raw.contains("mangohud"),
+            "выключенное уехало в конфиг: {raw}"
+        );
+        for mode in Hud::ALL {
+            assert_eq!(Hud::from_cfg(mode.to_cfg()), mode, "потеряли {mode:?}");
+        }
+        assert!(Hud::Auto.acts(true));
+        assert!(!Hud::Auto.acts(false));
+        assert!(Hud::On.acts(false));
+        assert!(!Hud::Off.acts(true));
     }
 
     #[test]
@@ -4520,7 +4846,8 @@ DXVK_HUD = "compiler"
             args: vec!["-w 1920".into()],
             ..Default::default()
         };
-        let desc = plan(&cfg, Path::new("umu-run"), &Defaults::default()).expect("план собирается");
+        let desc =
+            plan(&cfg, Path::new("umu-run"), None, &Defaults::default()).expect("план собирается");
         assert_eq!(desc.lines().count(), 1, "не одна строка: {desc}");
         assert!(desc.starts_with("cd ") && desc.contains(" && "), "{desc}");
         assert!(desc.contains("GAMEID=my-game"), "{desc}");
