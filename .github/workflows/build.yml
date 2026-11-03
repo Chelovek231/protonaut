@@ -1,0 +1,26 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: cachix/install-nix-action@v31.11.3
+
+      - name: формат nix
+        run: nix fmt -- --check flake.nix nix/package.nix
+
+      - name: flake check
+        run: nix flake check
+
+      # тесты идут внутри пакета (doCheck), отдельный cargo test не нужен
+      - name: сборка и дым
+        run: |
+          nix build .#protonaut
+          ./result/bin/protonaut --version
+          ./result/bin/protonaut --help >/dev/null

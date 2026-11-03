@@ -25,19 +25,7 @@
 └─ umu-run · игр · запущено   ┴─ Ctrl+S · Ctrl+R · Ctrl+Q · Esc      ┘
 ```
 
-## Название и значок
-
-**protonaut** — «про тон» как космический полёт: тот же корень, но вместо
-«запускалки» обещание прокатиться. Прежнее имя (`umulaunch`) было именем
-инструмента, а не программы, и совпадало с пакетом umu-launcher, из-за чего в
-`PATH`, в логах и в меню было два почти одинаковых соседа.
-
-Значок — плоский знак: тёмная плитка, орбита с двумя электронами и треугольник
-пуска. Исходник векторный ([`assets/protonaut.svg`](assets/protonaut.svg)), поэтому
-он чистый по лицензии (для подачи в nixpkgs это важно) и не мылится на ретине.
-На 16 и 24 пикселах орбита исчезает — там она превращается в кашу, — и остаётся
-только пуск с точкой ([`assets/protonaut-tiny.svg`](assets/protonaut-tiny.svg));
-с 32 пикселей — вариант с утолщённым кольцом.
+## Значок
 
 Что куда попадает:
 
@@ -63,7 +51,7 @@
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    protonaut.url = "github:ВАШ/protonaut";
+    protonaut.url = "github:Chelovek231/protonaut";
   };
 
   outputs = { nixpkgs, protonaut, ... }: {
@@ -87,7 +75,7 @@
 Пакет также можно поставить в профиле пользователя:
 
 ```bash
-nix profile install github:ВАШ/protonaut
+nix profile install github:Chelovek231/protonaut
 ```
 
 ### Непакетная сборка
@@ -111,7 +99,7 @@ rustPlatform.buildRustPackage rec {
   pname = "protonaut";
   version = "0.1.0";
   src = fetchFromGitHub {
-    owner = "ВАШ";
+    owner = "Chelovek231";
     repo = "protonaut";
     rev = "v${version}";
     hash = "sha256-…";
