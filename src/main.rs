@@ -11,15 +11,18 @@ use std::time::{Duration, Instant};
 use ashpd::PortalError;
 use ashpd::desktop::ResponseError;
 use ashpd::desktop::file_chooser::{FileFilter, SelectedFiles};
+use iced::animation::{Animation, Easing};
 use iced::border::Radius;
+use iced::font::Weight;
+use iced::gradient::Linear as LinearGradient;
 use iced::keyboard::{self, Modifiers};
 use iced::widget::{
     Column, Row, Space, TextInput, button, container, pick_list, progress_bar, scrollable, text,
     text_input,
 };
 use iced::{
-    Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Size, Subscription,
-    Task, Theme, Vector,
+    Alignment, Background, Border, Color, Element, Font, Gradient, Length, Padding, Radians,
+    Shadow, Size, Subscription, Task, Theme, Vector,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,20 +30,34 @@ const APP: &str = "protonaut";
 const STORES: [&str; 6] = ["none", "heroic", "gog", "epicgames", "legendary", "other"];
 
 // Палитра. Тема одна, светлого варианта нет — цвета можно держать константами.
-const BG: Color = Color::from_rgb(0.075, 0.082, 0.102);
+const BG: Color = Color::from_rgb(0.063, 0.071, 0.094);
+/// Верх фона: чуть светлее и синее, чтобы окно не выглядело плоским.
+const BG_TOP: Color = Color::from_rgb(0.086, 0.102, 0.145);
 /// Дно утопленных блоков: команды, лога, списка установленных раннеров.
-const BG_DEEP: Color = Color::from_rgb(0.051, 0.055, 0.07);
-const CARD: Color = Color::from_rgb(0.102, 0.114, 0.137);
-const CARD_HOVER: Color = Color::from_rgb(0.129, 0.145, 0.176);
-const LINE: Color = Color::from_rgb(0.184, 0.2, 0.239);
-const TEXT: Color = Color::from_rgb(0.902, 0.91, 0.937);
-const MUTED: Color = Color::from_rgb(0.545, 0.565, 0.639);
+const BG_DEEP: Color = Color::from_rgb(0.043, 0.048, 0.063);
+const CARD: Color = Color::from_rgb(0.098, 0.11, 0.137);
+const CARD_TOP: Color = Color::from_rgb(0.118, 0.133, 0.169);
+const CARD_HOVER: Color = Color::from_rgb(0.137, 0.153, 0.192);
+const LINE: Color = Color::from_rgb(0.19, 0.208, 0.255);
+const TEXT: Color = Color::from_rgb(0.925, 0.933, 0.957);
+const MUTED: Color = Color::from_rgb(0.565, 0.596, 0.678);
 const PRIMARY: Color = Color::from_rgb(0.435, 0.549, 1.0);
-/// Цвет пилюли с именем раннера: отличим от статуса, но не кричит.
-const RUNNER_TINT: Color = Color::from_rgb(0.62, 0.74, 0.95);
+const PRIMARY_LIGHT: Color = Color::from_rgb(0.545, 0.663, 1.0);
+const PRIMARY_DEEP: Color = Color::from_rgb(0.294, 0.388, 0.859);
 const SUCCESS: Color = Color::from_rgb(0.306, 0.796, 0.443);
 const WARNING: Color = Color::from_rgb(0.878, 0.639, 0.333);
 const DANGER: Color = Color::from_rgb(0.878, 0.396, 0.373);
+const DANGER_DEEP: Color = Color::from_rgb(0.72, 0.278, 0.302);
+
+/// Плавный переход интерфейса: 160–220 мс, чтобы движение читалось, но не
+/// задерживало работу с лаунчером.
+fn anim_bool(initial: bool) -> Animation<bool> {
+    Animation::new(initial).quick().easing(Easing::EaseOutCubic)
+}
+
+fn anim_float(initial: f32) -> Animation<f32> {
+    Animation::new(initial).quick().easing(Easing::EaseOutCubic)
+}
 
 fn theme() -> Theme {
     Theme::custom(
@@ -721,6 +738,8 @@ enum Message {
     Edit(usize),
     Delete(usize),
     Tick,
+    /// Кадр анимации: перерисовка без побочных эффектов.
+    Frame,
     Filter(String),
     ScanDir(String),
     Scan,
@@ -808,6 +827,20 @@ struct State {
     /// Карточка параметров по умолчанию развёрнута: она съедает треть окна,
     /// а правят её редко.
     settings_open: bool,
+    /// Переходы интерфейса. Значение `Animation<bool>` читается как 0..1:
+    /// так одна и та же пара «закрыто/открыто» плавно перекрашивает элементы.
+    settings_anim: Animation<bool>,
+    downloads_anim: Animation<bool>,
+    selection_anim: Animation<bool>,
+    /// За каким индексом анимация выбора уже следит: смена выбора
+    /// перезапускает подсветку строки.
+    selection_seen: Option<usize>,
+    pane_anim: Animation<bool>,
+    banner_anim: Animation<bool>,
+    /// Плавный прогресс загрузки Proton: обновления из сети приходят рывками.
+    progress_anim: Animation<f32>,
+    /// Пульс индикатора запущенной игры; повторяется сам, пока игра идёт.
+    pulse_anim: Animation<f32>,
 }
 
 impl State {
@@ -840,12 +873,64 @@ impl State {
             dl_removing: None,
             dl_error: None,
             settings_open: true,
+            settings_anim: anim_bool(false),
+            downloads_anim: anim_bool(false),
+            selection_anim: anim_bool(false),
+            selection_seen: None,
+            pane_anim: anim_bool(false),
+            banner_anim: anim_bool(false),
+            progress_anim: anim_float(0.0),
+            pulse_anim: Animation::new(0.0)
+                .very_slow()
+                .repeat_forever()
+                .auto_reverse()
+                .easing(Easing::EaseInOut),
         };
         state.reload();
         // Конфиг с играми означает «параметры уже настроены»: сворачиваем
         // карточку и отдаём место списку.
         state.settings_open = state.games.is_empty();
         state
+    }
+
+    /// Подтягивает переходы к текущему состоянию. Вызывается после каждого
+    /// сообщения, поэтому обработчикам не нужно помнить про анимации.
+    fn sync_animations(&mut self, now: Instant) {
+        // Смена выбранной строки запускает подсветку заново, а не оставляет
+        // её уже полностью проявившейся.
+        if self.selection_seen != self.selected {
+            self.selection_seen = self.selected;
+            self.selection_anim = anim_bool(false);
+        }
+        self.settings_anim.go_mut(self.settings_open, now);
+        self.downloads_anim.go_mut(self.dl_open, now);
+        self.selection_anim.go_mut(self.selected.is_some(), now);
+        let has_pane = self.draft.is_some() || self.dl_open || self.selected.is_some();
+        self.pane_anim.go_mut(has_pane, now);
+        // `dl_error` живёт внутри панели загрузки, но проявляется тем же
+        // переходом, что и остальные баннеры.
+        let banner = self.error.is_some()
+            || self.warn.is_some()
+            || self.notice.is_some()
+            || self.dl_error.is_some();
+        self.banner_anim.go_mut(banner, now);
+        if self.games.iter().any(|g| g.child.is_some()) {
+            self.pulse_anim.go_mut(1.0, now);
+        }
+        if let Some(part) = self.dl_job.as_ref().and_then(|p| p.fraction()) {
+            self.progress_anim.go_mut(part, now);
+        }
+    }
+
+    /// Есть ли что перерисовывать каждый кадр. Иначе окно спит и не жжёт CPU.
+    fn animating(&self, now: Instant) -> bool {
+        self.settings_anim.is_animating(now)
+            || self.downloads_anim.is_animating(now)
+            || self.selection_anim.is_animating(now)
+            || self.pane_anim.is_animating(now)
+            || self.banner_anim.is_animating(now)
+            || self.progress_anim.is_animating(now)
+            || (self.games.iter().any(|g| g.child.is_some()) && self.pulse_anim.is_animating(now))
     }
 
     fn reload(&mut self) {
@@ -2705,6 +2790,7 @@ fn dl_update(state: &mut State, message: &Message) -> Option<Task<Message>> {
             state.dl_last = None;
             state.dl_error = None;
             state.notice = None;
+            state.progress_anim = anim_float(0.0);
             state.warn = if release.sum.is_none() {
                 Some("в этом релизе нет файла контрольной суммы — ставим как есть".to_string())
             } else {
@@ -2844,10 +2930,20 @@ fn dl_update(state: &mut State, message: &Message) -> Option<Task<Message>> {
 }
 
 fn update(state: &mut State, message: Message) -> Task<Message> {
+    // Сначала обычная обработка, затем подтягиваем переходы к новому
+    // состоянию. Так любое действие — запуск, выбор, ошибка — само включает
+    // нужную анимацию.
+    let task = handle(state, message);
+    state.sync_animations(Instant::now());
+    task
+}
+
+fn handle(state: &mut State, message: Message) -> Task<Message> {
     // Действие (кнопка, выбор, сохранение) снимает прошлые подсказки: они
     // относились к прежнему шагу. Печать в полях и тик — нет.
     match message {
         Message::Tick
+        | Message::Frame
         | Message::Filter(_)
         | Message::ScanDir(_)
         | Message::PrefixRoot(_)
@@ -2977,6 +3073,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
             }
         }
+        // Кадр анимации не меняет состояние: сама перерисовка уже случилась.
+        Message::Frame => {}
         Message::Filter(s) => state.filter = s,
         Message::ScanDir(s) => state.scan_dir = s,
         Message::Scan => {
@@ -3156,15 +3254,16 @@ fn subscription(state: &State) -> Subscription<Message> {
     let keys = keyboard::listen().map(Message::Key);
     let closes = iced::event::listen_with(on_window_event);
     let busy = state.games.iter().any(|g| g.child.is_some()) || state.dl_job.is_some();
-    if busy {
-        Subscription::batch([
-            keys,
-            closes,
-            iced::time::every(Duration::from_millis(400)).map(|_| Message::Tick),
-        ])
-    } else {
-        Subscription::batch([keys, closes])
+    let mut subs = vec![keys, closes];
+    // Кадры нужны только пока что-то движется: запущенная игра пульсирует,
+    // остальные переходы живут 200 мс.
+    if busy || state.animating(Instant::now()) {
+        subs.push(iced::window::frames().map(|_| Message::Frame));
     }
+    if busy {
+        subs.push(iced::time::every(Duration::from_millis(400)).map(|_| Message::Tick));
+    }
+    Subscription::batch(subs)
 }
 
 // ---------------------------------------------------------------- view
@@ -3175,21 +3274,41 @@ fn tint(c: Color, a: f32) -> Color {
     Color { a, ..c }
 }
 
-fn soft_shadow(y: f32, blur: f32) -> Shadow {
+/// Смешивает два цвета: этим живут переходы — от спокойного к акцентному.
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
+/// Линейный градиент из двух стопов: фон окна, карточек и акцентных кнопок.
+fn gradient(angle: f32, from: Color, to: Color) -> Gradient {
+    Gradient::Linear(
+        LinearGradient::new(Radians(angle))
+            .add_stop(0.0, from)
+            .add_stop(1.0, to),
+    )
+}
+
+fn glow_shadow(color: Color, alpha: f32, y: f32, blur: f32) -> Shadow {
     Shadow {
-        color: tint(Color::BLACK, 0.4),
+        color: tint(color, alpha),
         offset: Vector { x: 0.0, y },
         blur_radius: blur,
     }
 }
 
-fn card_style(_: &Theme) -> container::Style {
+fn card_style_at(glow: f32) -> container::Style {
     container::Style {
-        background: Some(Background::Color(CARD)),
+        background: Some(Background::Gradient(gradient(1.15, CARD_TOP, CARD))),
         border: Border {
-            color: LINE,
+            color: mix(LINE, tint(PRIMARY, 0.55), glow),
             width: 1.0,
-            radius: Radius::from(12.0),
+            radius: Radius::from(16.0),
         },
         // Тени нет: программный рендер tiny-skia рисует тень контейнера поверх
         // его же фона, когда внутри есть scrollable, — карточка темнеет пятнами.
@@ -3198,34 +3317,57 @@ fn card_style(_: &Theme) -> container::Style {
     }
 }
 
-fn sunken_style(_: &Theme) -> container::Style {
+fn card_style(_: &Theme) -> container::Style {
+    card_style_at(0.0)
+}
+
+fn topbar_style(_: &Theme) -> container::Style {
     container::Style {
-        background: Some(Background::Color(BG_DEEP)),
+        background: Some(Background::Gradient(gradient(
+            0.65,
+            mix(CARD_TOP, tint(PRIMARY, 1.0), 0.13),
+            CARD,
+        ))),
         border: Border {
-            color: LINE,
+            color: mix(LINE, tint(PRIMARY, 0.4), 0.28),
             width: 1.0,
-            radius: Radius::from(9.0),
+            radius: Radius::from(18.0),
         },
         ..Default::default()
     }
 }
 
-fn card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    container(content)
-        .padding(14)
-        .width(Length::Fill)
-        .style(card_style)
-        .into()
+fn root_style(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Gradient(gradient(1.4, BG_TOP, BG))),
+        ..Default::default()
+    }
+}
+
+fn sunken_style(_: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Gradient(gradient(
+            1.1,
+            mix(BG_DEEP, Color::BLACK, 0.15),
+            BG_DEEP,
+        ))),
+        border: Border {
+            color: mix(LINE, BG_DEEP, 0.35),
+            width: 1.0,
+            radius: Radius::from(11.0),
+        },
+        ..Default::default()
+    }
 }
 
 /// Та же карточка, но тянется по высоте: правая панель должна занимать всё
 /// свободное место, иначе scrollable внутри схлопывается в ноль.
-fn card_grow<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+fn card_grow<'a>(content: impl Into<Element<'a, Message>>, glow: f32) -> Element<'a, Message> {
     container(content)
-        .padding(14)
+        .padding(16)
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(card_style)
+        .style(move |_: &Theme| card_style_at(glow))
         .into()
 }
 
@@ -3238,112 +3380,205 @@ fn scroll_pad<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Messa
         .into()
 }
 
-fn ghost_style(_: &Theme, status: button::Status) -> button::Style {
-    button::Style {
-        background: Some(Background::Color(match status {
-            button::Status::Hovered | button::Status::Pressed => CARD_HOVER,
-            _ => CARD,
-        })),
-        text_color: TEXT,
+/// Тонкий скроллбар: в тёмной теме стандартная широкая полоса выглядит чужой.
+fn scroll_style(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let hovered = matches!(
+        status,
+        scrollable::Status::Hovered {
+            is_vertical_scrollbar_hovered: true,
+            ..
+        } | scrollable::Status::Dragged {
+            is_vertical_scrollbar_dragged: true,
+            ..
+        }
+    );
+    let mut style = scrollable::default(theme, status);
+    let rail = scrollable::Rail {
+        background: Some(Background::Color(tint(BG_DEEP, 0.35))),
         border: Border {
-            color: LINE,
+            radius: Radius::from(999.0),
+            ..Default::default()
+        },
+        scroller: scrollable::Scroller {
+            background: Background::Color(if hovered {
+                tint(PRIMARY, 0.85)
+            } else {
+                tint(PRIMARY, 0.38)
+            }),
+            border: Border {
+                radius: Radius::from(999.0),
+                ..Default::default()
+            },
+        },
+    };
+    style.vertical_rail = rail;
+    style.horizontal_rail = rail;
+    style
+}
+
+fn input_style(_: &Theme, status: text_input::Status) -> text_input::Style {
+    let focused = matches!(
+        status,
+        text_input::Status::Focused { .. } | text_input::Status::Hovered
+    );
+    text_input::Style {
+        background: Background::Color(BG_DEEP),
+        border: Border {
+            color: if focused { tint(PRIMARY, 0.75) } else { LINE },
             width: 1.0,
-            radius: Radius::from(9.0),
+            radius: Radius::from(10.0),
+        },
+        icon: MUTED,
+        placeholder: MUTED,
+        value: TEXT,
+        selection: tint(PRIMARY, 0.45),
+    }
+}
+
+fn pick_style(_: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let hot = !matches!(status, pick_list::Status::Active);
+    pick_list::Style {
+        text_color: TEXT,
+        placeholder_color: MUTED,
+        handle_color: if hot { PRIMARY } else { MUTED },
+        background: Background::Color(BG_DEEP),
+        border: Border {
+            color: if hot { tint(PRIMARY, 0.75) } else { LINE },
+            width: 1.0,
+            radius: Radius::from(10.0),
+        },
+    }
+}
+
+fn progress_style(_: &Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(tint(PRIMARY, 0.12)),
+        bar: Background::Gradient(gradient(0.0, PRIMARY_LIGHT, PRIMARY)),
+        border: Border {
+            color: tint(PRIMARY, 0.28),
+            width: 1.0,
+            radius: Radius::from(999.0),
+        },
+    }
+}
+
+fn ghost_style(_: &Theme, status: button::Status) -> button::Style {
+    let hot = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: Some(Background::Color(if hot {
+            mix(CARD_HOVER, tint(PRIMARY, 0.16), 0.45)
+        } else {
+            CARD
+        })),
+        text_color: if hot { TEXT } else { mix(TEXT, MUTED, 0.2) },
+        border: Border {
+            color: if hot { tint(PRIMARY, 0.45) } else { LINE },
+            width: 1.0,
+            radius: Radius::from(10.0),
         },
         ..Default::default()
     }
 }
 
 /// Переключатель панели: когда панель открыта, кнопка выглядит включённой.
-fn toggle_style(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_, status| button::Style {
-        background: Some(Background::Color(if active {
-            tint(PRIMARY, 0.18)
-        } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-            CARD_HOVER
-        } else {
-            CARD
-        })),
-        text_color: if active { PRIMARY } else { TEXT },
-        border: Border {
-            color: if active { tint(PRIMARY, 0.6) } else { LINE },
-            width: 1.0,
-            radius: Radius::from(9.0),
-        },
-        ..Default::default()
+/// `t` — плавное значение 0..1, чтобы цвет не щёлкал.
+fn toggle_style(active: bool, t: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let hot = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let base = if hot { CARD_HOVER } else { CARD };
+        button::Style {
+            background: Some(Background::Color(mix(base, tint(PRIMARY, 0.24), t))),
+            text_color: mix(TEXT, PRIMARY_LIGHT, t),
+            border: Border {
+                color: mix(LINE, tint(PRIMARY, 0.62), t),
+                width: 1.0,
+                radius: Radius::from(10.0),
+            },
+            shadow: if active {
+                glow_shadow(PRIMARY, 0.18 * t, 2.0, 12.0)
+            } else {
+                Shadow::default()
+            },
+            ..Default::default()
+        }
     }
 }
 
 fn primary_style(_: &Theme, status: button::Status) -> button::Style {
-    let shade = match status {
-        button::Status::Pressed => 0.78,
-        button::Status::Hovered => 0.9,
-        _ => 1.0,
+    let (from, to) = match status {
+        button::Status::Pressed => (
+            mix(PRIMARY_LIGHT, Color::BLACK, 0.2),
+            mix(PRIMARY_DEEP, Color::BLACK, 0.2),
+        ),
+        button::Status::Hovered => (mix(PRIMARY_LIGHT, Color::WHITE, 0.12), PRIMARY),
+        _ => (PRIMARY_LIGHT, PRIMARY_DEEP),
     };
     button::Style {
-        background: Some(Background::Color(Color::from_rgb(
-            PRIMARY.r * shade,
-            PRIMARY.g * shade,
-            PRIMARY.b * shade,
-        ))),
-        text_color: Color::from_rgb(0.08, 0.09, 0.12),
+        background: Some(Background::Gradient(gradient(0.35, from, to))),
+        text_color: Color::from_rgb(0.055, 0.063, 0.09),
         border: Border {
-            color: LINE,
+            color: tint(PRIMARY_LIGHT, 0.5),
             width: 0.0,
-            radius: Radius::from(9.0),
+            radius: Radius::from(10.0),
         },
-        shadow: soft_shadow(1.0, 6.0),
+        shadow: glow_shadow(PRIMARY, 0.34, 3.0, 14.0),
         ..Default::default()
     }
 }
 
 fn danger_style(_: &Theme, status: button::Status) -> button::Style {
-    let shade = match status {
-        button::Status::Pressed => 0.78,
-        button::Status::Hovered => 0.9,
-        _ => 1.0,
+    let (from, to) = match status {
+        button::Status::Pressed => (
+            mix(DANGER, Color::BLACK, 0.2),
+            mix(DANGER_DEEP, Color::BLACK, 0.2),
+        ),
+        button::Status::Hovered => (mix(DANGER, Color::WHITE, 0.12), DANGER_DEEP),
+        _ => (DANGER, DANGER_DEEP),
     };
     button::Style {
-        background: Some(Background::Color(Color::from_rgb(
-            DANGER.r * shade,
-            DANGER.g * shade,
-            DANGER.b * shade,
-        ))),
-        text_color: Color::from_rgb(0.08, 0.09, 0.12),
+        background: Some(Background::Gradient(gradient(0.35, from, to))),
+        text_color: Color::from_rgb(0.07, 0.06, 0.075),
         border: Border {
-            color: LINE,
+            color: tint(DANGER, 0.45),
             width: 0.0,
-            radius: Radius::from(9.0),
+            radius: Radius::from(10.0),
         },
+        shadow: glow_shadow(DANGER, 0.24, 2.0, 10.0),
         ..Default::default()
     }
 }
 
-fn row_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
-    move |_, status| button::Style {
-        background: Some(Background::Color(match (selected, status) {
-            (_, button::Status::Pressed) => CARD_HOVER.scale_alpha(0.8),
-            (true, _) | (_, button::Status::Hovered) => CARD_HOVER,
-            _ => CARD,
-        })),
-        text_color: TEXT,
-        border: Border {
-            color: if selected { tint(PRIMARY, 0.7) } else { LINE },
-            width: 1.0,
-            radius: Radius::from(11.0),
-        },
-        shadow: if selected {
-            soft_shadow(2.0, 8.0)
+/// `glow` — плавная подсветка выбранной строки: 0 в покое, 1 после клика.
+fn row_style(selected: bool, glow: f32) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_, status| {
+        let hot = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let base = if hot {
+            mix(CARD_HOVER, tint(PRIMARY, 0.16), 0.35)
         } else {
-            Shadow::default()
-        },
-        ..Default::default()
+            CARD
+        };
+        let glow = if selected { glow } else { 0.0 };
+        button::Style {
+            background: Some(Background::Color(mix(base, tint(PRIMARY, 0.2), glow * 0.6))),
+            text_color: TEXT,
+            border: Border {
+                color: mix(LINE, tint(PRIMARY, 0.78), glow),
+                width: 1.0,
+                radius: Radius::from(13.0),
+            },
+            shadow: if selected {
+                glow_shadow(PRIMARY, 0.2 * glow, 3.0, 16.0)
+            } else {
+                Shadow::default()
+            },
+            ..Default::default()
+        }
     }
 }
 
 fn action<'a>(title: &'a str, message: Message) -> Element<'a, Message> {
     button(text(title).size(12))
-        .padding([7, 13])
+        .padding([8, 15])
         .style(primary_style)
         .on_press(message)
         .into()
@@ -3351,7 +3586,7 @@ fn action<'a>(title: &'a str, message: Message) -> Element<'a, Message> {
 
 fn ghost<'a>(title: &'a str, message: Message) -> Element<'a, Message> {
     button(text(title).size(12))
-        .padding([7, 13])
+        .padding([8, 14])
         .style(ghost_style)
         .on_press(message)
         .into()
@@ -3359,7 +3594,7 @@ fn ghost<'a>(title: &'a str, message: Message) -> Element<'a, Message> {
 
 fn danger<'a>(title: &'a str, message: Message) -> Element<'a, Message> {
     button(text(title).size(12))
-        .padding([7, 13])
+        .padding([8, 14])
         .style(danger_style)
         .on_press(message)
         .into()
@@ -3369,10 +3604,57 @@ fn label(t: impl Into<Cow<'static, str>>) -> Element<'static, Message> {
     text(t.into().into_owned()).size(10).color(MUTED).into()
 }
 
+/// Заголовок с более плотным начертанием: иерархия без отдельного шрифта.
+fn title(t: impl Into<Cow<'static, str>>, size: f32) -> Element<'static, Message> {
+    text(t.into().into_owned())
+        .size(size)
+        .font(Font {
+            weight: Weight::Semibold,
+            ..Font::DEFAULT
+        })
+        .color(TEXT)
+        .into()
+}
+
+/// Плитка игры: буква названия на мягком градиенте. Слева список читается
+/// быстрее, чем по одной строке текста.
+fn game_tile(name: &str, color: Color) -> Element<'static, Message> {
+    let letter = name
+        .trim()
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "▶".to_string());
+    container(
+        text(letter)
+            .size(16)
+            .font(Font {
+                weight: Weight::Bold,
+                ..Font::DEFAULT
+            })
+            .color(mix(TEXT, color, 0.55)),
+    )
+    .center(38)
+    .style(move |_: &Theme| container::Style {
+        background: Some(Background::Gradient(gradient(
+            0.7,
+            tint(color, 0.22),
+            tint(color, 0.055),
+        ))),
+        border: Border {
+            color: tint(color, 0.35),
+            width: 1.0,
+            radius: Radius::from(11.0),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
 /// Кнопка внутри заголовка раздела: меньше обычной, чтобы не ломать строку.
 fn mini<'a>(title: &'a str, message: Message) -> Element<'a, Message> {
     button(text(title).size(11))
-        .padding([4, 10])
+        .padding([5, 11])
         .style(ghost_style)
         .on_press(message)
         .into()
@@ -3381,8 +3663,8 @@ fn mini<'a>(title: &'a str, message: Message) -> Element<'a, Message> {
 /// Сегмент переключателя: активный подсвечен, остальные ждут нажатия.
 fn seg<'a>(title: &'a str, message: Message, active: bool) -> Element<'a, Message> {
     button(text(title).size(11))
-        .padding([6, 11])
-        .style(toggle_style(active))
+        .padding([6, 12])
+        .style(toggle_style(active, if active { 1.0 } else { 0.0 }))
         .on_press(message)
         .into()
 }
@@ -3415,7 +3697,7 @@ fn settings_summary(state: &State) -> String {
         state.defaults.runner.as_deref().unwrap_or("авто"),
         state.defaults.store.as_deref().unwrap_or("none"),
         state.prefix_root_input,
-        umu_label(&state.umu),
+        umu_tag(&state.umu),
         if state.defaults.mangohud {
             "включён"
         } else {
@@ -3436,7 +3718,7 @@ fn value(t: impl Into<Cow<'static, str>>) -> Element<'static, Message> {
 fn kv(k: &'static str, v: impl Into<Cow<'static, str>>) -> Row<'static, Message> {
     Row::with_capacity(2)
         .spacing(10)
-        .push(text(k).size(10).color(MUTED).width(Length::Fixed(112.0)))
+        .push(text(k).size(10).color(MUTED).width(Length::Fixed(118.0)))
         .push(container(value(v.into().into_owned())).width(Length::Fill))
 }
 
@@ -3471,7 +3753,7 @@ fn hairline() -> Element<'static, Message> {
     container(Space::new().width(Length::Fill))
         .height(1)
         .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(LINE)),
+            background: Some(Background::Gradient(gradient(0.0, LINE, tint(LINE, 0.02)))),
             ..Default::default()
         })
         .into()
@@ -3479,10 +3761,20 @@ fn hairline() -> Element<'static, Message> {
 
 /// Заголовок раздела карточки: название слева, справа — сколько чего найдено.
 fn section<'a>(title: &'static str, right: Option<Element<'a, Message>>) -> Column<'a, Message> {
-    let mut row = Row::with_capacity(2)
-        .spacing(10)
+    let dot = container(Space::new().width(5).height(5)).style(|_: &Theme| container::Style {
+        background: Some(Background::Color(PRIMARY)),
+        border: Border {
+            radius: Radius::from(999.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let mut row = Row::with_capacity(4)
+        .spacing(8)
         .align_y(Alignment::Center)
-        .push(text(title).size(11).color(MUTED));
+        .push(dot)
+        .push(text(title).size(11).color(MUTED))
+        .push(container(Space::new().width(Length::Fill)));
     if let Some(e) = right {
         row = row.push(e);
     }
@@ -3497,11 +3789,11 @@ fn chip(title: impl Into<Cow<'static, str>>, color: Color) -> Element<'static, M
     container(text(title.into().into_owned()).size(10).color(color))
         .padding([3, 9])
         .style(move |_: &Theme| container::Style {
-            background: Some(Background::Color(tint(color, 0.10))),
+            background: Some(Background::Color(tint(color, 0.11))),
             border: Border {
-                color: tint(color, 0.35),
+                color: tint(color, 0.38),
                 width: 1.0,
-                radius: Radius::from(8.0),
+                radius: Radius::from(999.0),
             },
             ..Default::default()
         })
@@ -3509,36 +3801,50 @@ fn chip(title: impl Into<Cow<'static, str>>, color: Color) -> Element<'static, M
 }
 
 /// Баннер ответа: то же, что цветной текст, но его невозможно не заметить.
+/// `fade` — 0..1: новый баннер появляется плавно, а не выскакивает.
 fn banner(
     mark: &'static str,
     caption: &'static str,
     body: impl Into<Cow<'static, str>>,
     color: Color,
+    fade: f32,
 ) -> Element<'static, Message> {
     let body = body.into().into_owned();
+    let fade = fade.clamp(0.0, 1.0);
     container(
         Row::with_capacity(3)
             .spacing(10)
             .align_y(Alignment::Center)
-            .push(text(mark).size(12).color(color).width(Length::Fixed(14.0)))
+            .push(
+                text(mark)
+                    .size(12)
+                    .color(tint(color, fade))
+                    .width(Length::Fixed(14.0)),
+            )
             .push(
                 text(caption)
                     .size(11)
-                    .color(color)
+                    .color(tint(color, fade))
                     .width(Length::Fixed(78.0)),
             )
             .push(
-                container(text(body).size(12).color(TEXT).width(Length::Fill)).width(Length::Fill),
+                container(
+                    text(body)
+                        .size(12)
+                        .color(tint(TEXT, fade))
+                        .width(Length::Fill),
+                )
+                .width(Length::Fill),
             ),
     )
-    .padding([9, 12])
+    .padding([10, 13])
     .width(Length::Fill)
     .style(move |_: &Theme| container::Style {
-        background: Some(Background::Color(tint(color, 0.10))),
+        background: Some(Background::Color(tint(color, 0.11 * fade))),
         border: Border {
-            color: tint(color, 0.4),
+            color: tint(color, 0.44 * fade),
             width: 1.0,
-            radius: Radius::from(10.0),
+            radius: Radius::from(12.0),
         },
         ..Default::default()
     })
@@ -3547,20 +3853,28 @@ fn banner(
 
 /// Знак марки приложения: треугольник на плашке акцентного цвета.
 fn logotype<'a>() -> Element<'a, Message> {
-    container(text("▶").size(11).color(Color::from_rgb(0.08, 0.09, 0.12)))
-        // center задаёт и размер, и выравнивание: width/height здесь уже не нужны
-        .center(28)
-        .style(|_: &Theme| container::Style {
-            background: Some(Background::Color(PRIMARY)),
-            border: Border {
-                color: LINE,
-                width: 0.0,
-                radius: Radius::from(9.0),
-            },
-            shadow: soft_shadow(2.0, 8.0),
-            ..Default::default()
-        })
-        .into()
+    container(
+        text("▶")
+            .size(14)
+            .color(Color::from_rgb(0.055, 0.063, 0.09)),
+    )
+    // center задаёт и размер, и выравнивание: width/height здесь уже не нужны
+    .center(38)
+    .style(|_: &Theme| container::Style {
+        background: Some(Background::Gradient(gradient(
+            0.7,
+            PRIMARY_LIGHT,
+            PRIMARY_DEEP,
+        ))),
+        border: Border {
+            color: tint(PRIMARY_LIGHT, 0.55),
+            width: 0.0,
+            radius: Radius::from(12.0),
+        },
+        shadow: glow_shadow(PRIMARY, 0.42, 4.0, 16.0),
+        ..Default::default()
+    })
+    .into()
 }
 
 fn field<'a>(
@@ -3571,7 +3885,8 @@ fn field<'a>(
     text_input(placeholder, value)
         .on_input(msg)
         .size(13)
-        .padding([7, 10])
+        .padding([8, 11])
+        .style(input_style)
 }
 
 /// Поле пути с кнопкой «обзор»: путь из памяти вспоминать не нужно.
@@ -3607,8 +3922,9 @@ fn runner_pick<'a>(
     };
     pick_list(runners, selected, msg)
         .text_size(13)
-        .padding([7, 10])
+        .padding([8, 11])
         .width(Length::Fill)
+        .style(pick_style)
         .into()
 }
 
@@ -3618,7 +3934,8 @@ fn store_pick(current: &str, msg: fn(String) -> Message) -> Element<'static, Mes
         msg(s.to_string())
     })
     .text_size(13)
-    .padding([7, 10])
+    .padding([8, 11])
+    .style(pick_style)
     .into()
 }
 
@@ -3665,39 +3982,60 @@ fn umu_label(umu: &Path) -> String {
 }
 
 fn view(state: &State) -> Column<'_, Message> {
+    let now = Instant::now();
+    let settings_t = state.settings_anim.interpolate(0.0, 1.0, now);
+    let downloads_t = state.downloads_anim.interpolate(0.0, 1.0, now);
+    let selection_t = state.selection_anim.interpolate(0.0, 1.0, now);
+    let banner_t = state.banner_anim.interpolate(0.0, 1.0, now);
+    let pane_t = state.pane_anim.interpolate(0.0, 1.0, now);
+    let running = state.games.iter().filter(|g| g.child.is_some()).count();
+
     // ---- шапка: марка приложения, чем запускаем, затем действия
     let runner_count = state.runners.len().saturating_sub(1);
-    let header = Row::with_capacity(8)
+    let mut header_row = Row::with_capacity(9)
         .spacing(12)
         .align_y(Alignment::Center)
         .push(logotype())
         .push(
             Column::with_capacity(2)
                 .spacing(1)
-                .push(text(APP).size(18))
-                .push(text("игры через umu-launcher").size(10).color(MUTED)),
+                .push(title(APP, 22.0))
+                .push(
+                    text("запуск Windows-игр через umu-launcher")
+                        .size(10)
+                        .color(MUTED),
+                ),
         )
         .push(chip(
             umu_tag(&state.umu),
             if state.umu.exists() { MUTED } else { WARNING },
-        ))
-        .push(container(Space::new().width(Length::Fill)))
-        .push(
-            button(
-                text(if state.dl_open {
-                    "Proton: закрыть"
-                } else {
-                    "Proton: загрузки"
-                })
-                .size(12),
+        ));
+    if running > 0 {
+        header_row = header_row.push(chip(format!("● {running} идёт"), SUCCESS));
+    }
+    let header = container(
+        header_row
+            .push(container(Space::new().width(Length::Fill)))
+            .push(
+                button(
+                    text(if state.dl_open {
+                        "Proton: закрыть"
+                    } else {
+                        "Proton: загрузки"
+                    })
+                    .size(12),
+                )
+                .padding([8, 14])
+                .style(toggle_style(state.dl_open, downloads_t))
+                .on_press(Message::DlToggle),
             )
-            .padding([7, 13])
-            .style(toggle_style(state.dl_open))
-            .on_press(Message::DlToggle),
-        )
-        .push(ghost("перечитать", Message::Reload))
-        .push(ghost("сохранить", Message::Save))
-        .push(action("новая игра", Message::New));
+            .push(ghost("перечитать", Message::Reload))
+            .push(ghost("сохранить", Message::Save))
+            .push(action("+  новая игра", Message::New)),
+    )
+    .padding([11, 15])
+    .width(Length::Fill)
+    .style(topbar_style);
 
     // ---- параметры по умолчанию: что уйдёт в окружение, если игра не переопределила
     let settings_body: Element<'_, Message> = if state.settings_open {
@@ -3804,9 +4142,9 @@ fn view(state: &State) -> Column<'_, Message> {
             .wrapping(text::Wrapping::Word)
             .into()
     };
-    let settings = card(
+    let settings = container(
         Column::with_capacity(2)
-            .spacing(if state.settings_open { 10 } else { 8 })
+            .spacing(if state.settings_open { 11 } else { 8 })
             .push(section(
                 "по умолчанию",
                 Some(
@@ -3817,22 +4155,30 @@ fn view(state: &State) -> Column<'_, Message> {
                             format!("раннеров найдено {runner_count}"),
                             if runner_count > 0 { SUCCESS } else { WARNING },
                         ))
-                        .push(mini(
-                            if state.settings_open {
-                                "свернуть"
-                            } else {
-                                "изменить"
-                            },
-                            Message::SettingsToggle,
-                        ))
+                        .push(
+                            button(
+                                text(if state.settings_open {
+                                    "свернуть"
+                                } else {
+                                    "изменить"
+                                })
+                                .size(11),
+                            )
+                            .padding([5, 11])
+                            .style(toggle_style(state.settings_open, settings_t))
+                            .on_press(Message::SettingsToggle),
+                        )
                         .into(),
                 ),
             ))
             .push(settings_body),
-    );
+    )
+    .padding(16)
+    .width(Length::Fill)
+    .style(move |_: &Theme| card_style_at(settings_t * 0.8));
 
     // ---- библиотека
-    let mut list = Column::with_capacity(state.games.len() + 1).spacing(7);
+    let mut list = Column::with_capacity(state.games.len() + 1).spacing(8);
     let mut shown = 0usize;
     let filter = state.filter.trim().to_lowercase();
     for (i, g) in state.games.iter().enumerate() {
@@ -3843,7 +4189,7 @@ fn view(state: &State) -> Column<'_, Message> {
             continue;
         }
         shown += 1;
-        list = list.push(game_row(state, i, g));
+        list = list.push(game_row(state, i, g, selection_t));
     }
     if shown == 0 {
         list = list.push(
@@ -3861,11 +4207,11 @@ fn view(state: &State) -> Column<'_, Message> {
     } else {
         format!("{} игр", state.games.len())
     };
-    let running = state.games.iter().filter(|g| g.child.is_some()).count();
 
-    let mut tools = Row::with_capacity(3)
-        .spacing(8)
+    let mut tools = Row::with_capacity(4)
+        .spacing(9)
         .align_y(Alignment::Center)
+        .push(text("⌕").size(16).color(MUTED))
         .push(
             field(
                 "фильтр по имени или пути к .exe",
@@ -3881,7 +4227,7 @@ fn view(state: &State) -> Column<'_, Message> {
 
     let scan = container(
         Column::with_capacity(2)
-            .spacing(5)
+            .spacing(6)
             .push(label("папка библиотеки Steam — ищем */steamapps/common/*"))
             .push(
                 Row::with_capacity(3)
@@ -3899,26 +4245,56 @@ fn view(state: &State) -> Column<'_, Message> {
                     .push(ghost("найти игры", Message::Scan)),
             ),
     )
-    .padding(10)
+    .padding(12)
     .width(Length::Fill)
     .style(sunken_style);
 
     let left = Column::with_capacity(3)
-        .spacing(9)
+        .spacing(10)
         .width(Length::FillPortion(5))
         .height(Length::Fill)
         .push(tools)
         .push(
             scrollable(scroll_pad(list))
                 .height(Length::Fill)
-                .width(Length::Fill),
+                .width(Length::Fill)
+                .style(scroll_style),
         )
         .push(scan);
 
     // ---- правая колонка: карточка выбранного, затем лог
     let right_body: Element<'_, Message> = if let Some(d) = &state.draft {
-        Column::with_capacity(20)
-            .spacing(6)
+        let draft_title = if d.name.trim().is_empty() {
+            "новая игра".to_string()
+        } else {
+            d.name.clone()
+        };
+        let draft_tile = if d.name.trim().is_empty() {
+            "▶"
+        } else {
+            d.name.as_str()
+        };
+        Column::with_capacity(22)
+            .spacing(7)
+            .push(
+                Row::with_capacity(3)
+                    .spacing(11)
+                    .align_y(Alignment::Center)
+                    .push(game_tile(draft_tile, PRIMARY))
+                    .push(
+                        Column::with_capacity(2)
+                            .spacing(2)
+                            .width(Length::Fill)
+                            .push(title(draft_title, 18.0))
+                            .push(
+                                text("черновик: изменения попадут в конфиг после «применить»")
+                                    .size(10)
+                                    .color(MUTED),
+                            ),
+                    )
+                    .push(chip("черновик", WARNING)),
+            )
+            .push(hairline())
             .push(label("имя — задаёт имя лога и GAMEID по умолчанию"))
             .push(field("<имя игры>", &d.name, Message::DraftName))
             .push(
@@ -4003,11 +4379,26 @@ fn view(state: &State) -> Column<'_, Message> {
         dl_body(state)
     } else if let Some(cfg) = state.selected_cfg() {
         let ready = plan(cfg, &state.umu, state.hud.as_deref(), &state.defaults).is_ok();
-        let mut col = Column::with_capacity(14).spacing(7).push(
-            Row::with_capacity(2)
-                .spacing(10)
+        let mut col = Column::with_capacity(18).spacing(9).push(
+            Row::with_capacity(3)
+                .spacing(12)
                 .align_y(Alignment::Center)
-                .push(text(cfg.name.clone()).size(18).width(Length::Fill))
+                .push(game_tile(&cfg.name, if ready { PRIMARY } else { DANGER }))
+                .push(
+                    Column::with_capacity(2)
+                        .spacing(2)
+                        .width(Length::Fill)
+                        .push(title(cfg.name.clone(), 20.0))
+                        .push(
+                            text(if ready {
+                                "всё на месте — можно запускать"
+                            } else {
+                                "проверьте путь к .exe или раннер"
+                            })
+                            .size(10)
+                            .color(if ready { MUTED } else { DANGER }),
+                        ),
+                )
                 .push(chip(
                     if ready {
                         "готова к запуску"
@@ -4021,19 +4412,21 @@ fn view(state: &State) -> Column<'_, Message> {
         // прокручивать, а «удалить» остаётся на другом конце строки.
         if let Some(i) = state.selected {
             let game = &state.games[i];
-            col = col.push(
-                Row::with_capacity(4)
-                    .spacing(8)
-                    .align_y(Alignment::Center)
-                    .push(if game.child.is_some() {
-                        danger("остановить", Message::Stop(i))
-                    } else {
-                        action("▶  запустить", Message::Start(i))
-                    })
-                    .push(ghost("редактировать", Message::Edit(i)))
-                    .push(container(Space::new().width(Length::Fill)))
-                    .push(delete_button(state)),
-            );
+            col = col
+                .push(
+                    Row::with_capacity(4)
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .push(if game.child.is_some() {
+                            danger("■  остановить", Message::Stop(i))
+                        } else {
+                            action("▶  запустить", Message::Start(i))
+                        })
+                        .push(ghost("редактировать", Message::Edit(i)))
+                        .push(container(Space::new().width(Length::Fill)))
+                        .push(delete_button(state)),
+                )
+                .push(hairline());
         }
         col = col
             .push(kv("исполняемый файл", cfg.exe.clone()))
@@ -4144,7 +4537,7 @@ fn view(state: &State) -> Column<'_, Message> {
         .map(|g| g.log.display().to_string())
         .unwrap_or_else(|| "игра не выбрана".into());
     let right = Column::with_capacity(2)
-        .spacing(9)
+        .spacing(10)
         .width(Length::FillPortion(6))
         .height(Length::Fill)
         .push(card_grow(
@@ -4155,22 +4548,48 @@ fn view(state: &State) -> Column<'_, Message> {
                 .push(
                     scrollable(scroll_pad(right_body))
                         .height(Length::Fill)
-                        .width(Length::Fill),
+                        .width(Length::Fill)
+                        .style(scroll_style),
                 ),
+            pane_t * 0.45,
         ))
         .push(
             Column::with_capacity(2)
-                .spacing(5)
+                .spacing(6)
                 // лог знает свою высоту, остальное достаётся карточке игры
-                .height(Length::Fixed(170.0))
+                .height(Length::Fixed(190.0))
                 .push(
-                    Row::with_capacity(3)
+                    Row::with_capacity(4)
                         .spacing(8)
                         .align_y(Alignment::Center)
-                        .push(label("лог"))
                         .push(
-                            container(text(log_file).size(10).color(MUTED).width(Length::Fill))
-                                .width(Length::Fill),
+                            text("журнал")
+                                .size(11)
+                                .font(Font {
+                                    weight: Weight::Semibold,
+                                    ..Font::DEFAULT
+                                })
+                                .color(TEXT),
+                        )
+                        .push(chip(
+                            if running > 0 {
+                                "пишется"
+                            } else {
+                                "последний запуск"
+                            },
+                            if running > 0 { SUCCESS } else { MUTED },
+                        ))
+                        .push(container(Space::new().width(Length::Fill)))
+                        .push(
+                            container(
+                                text(clip(&log_file, 44))
+                                    .size(10)
+                                    .color(MUTED)
+                                    .wrapping(text::Wrapping::None),
+                            )
+                            .width(Length::Fill)
+                            .align_x(Alignment::End)
+                            .clip(true),
                         ),
                 )
                 .push(
@@ -4179,14 +4598,16 @@ fn view(state: &State) -> Column<'_, Message> {
                             text(log)
                                 .size(11)
                                 .color(TEXT)
+                                .font(Font::MONOSPACE)
                                 .wrapping(text::Wrapping::WordOrGlyph),
                         ))
                         .height(Length::Fill)
                         .width(Length::Fill)
                         .anchor_bottom()
-                        .auto_scroll(true),
+                        .auto_scroll(true)
+                        .style(scroll_style),
                     )
-                    .padding(10)
+                    .padding(11)
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .style(sunken_style),
@@ -4194,49 +4615,53 @@ fn view(state: &State) -> Column<'_, Message> {
         );
 
     let mut root = Column::with_capacity(5)
-        .spacing(12)
+        .spacing(14)
         .push(header)
         .push(settings)
         .push(
             Row::with_capacity(2)
-                .spacing(12)
+                .spacing(14)
                 .push(left)
                 .push(right)
                 .height(Length::Fill),
         );
     if let Some(e) = &state.error {
-        root = root.push(banner("✕", "ошибка", e.clone(), DANGER));
+        root = root.push(banner("✕", "ошибка", e.clone(), DANGER, banner_t));
     }
     if let Some(w) = &state.warn {
-        root = root.push(banner("!", "внимание", w.clone(), WARNING));
+        root = root.push(banner("!", "внимание", w.clone(), WARNING, banner_t));
     }
     if let Some(n) = &state.notice {
-        root = root.push(banner("✓", "готово", n.clone(), SUCCESS));
+        root = root.push(banner("✓", "готово", n.clone(), SUCCESS, banner_t));
     }
-    root = root.push(
-        Row::with_capacity(7)
+    root = root.push(hairline()).push(
+        Row::with_capacity(6)
             .spacing(8)
             .align_y(Alignment::Center)
             .push(chip(
-                format!("umu-run {}", umu_label(&state.umu)),
+                umu_tag(&state.umu),
                 if state.umu.exists() { MUTED } else { WARNING },
             ))
-            .push(chip(format!("игр {}", state.games.len()), MUTED))
+            .push(chip(
+                format!("{} игр · {} раннеров", state.games.len(), runner_count),
+                MUTED,
+            ))
             .push(chip(
                 format!("запущено {running}"),
                 if running > 0 { SUCCESS } else { MUTED },
             ))
-            .push(chip(format!("раннеров {runner_count}"), MUTED))
             .push(container(Space::new().width(Length::Fill)).width(Length::Fill))
-            .push(chip("Ctrl+S сохранить", MUTED))
-            .push(chip("Ctrl+R перечитать", MUTED))
-            .push(chip("Ctrl+Q выйти и сохранить", MUTED))
-            .push(chip("Esc отмена", MUTED)),
+            .push(
+                text("Ctrl+S сохранить · Ctrl+R перечитать · Ctrl+Q выйти · Esc отмена")
+                    .size(10)
+                    .color(MUTED),
+            ),
     );
     Column::with_capacity(1).push(
-        container(root.padding(16))
+        container(root.padding(18))
             .width(Length::Fill)
-            .height(Length::Fill),
+            .height(Length::Fill)
+            .style(root_style),
     )
 }
 
@@ -4244,30 +4669,55 @@ fn view(state: &State) -> Column<'_, Message> {
 /// а не голая строка.
 fn empty_state(state: &State) -> Element<'static, Message> {
     let filtering = !state.filter.trim().is_empty();
+    let color = if filtering { WARNING } else { PRIMARY };
     container(
         Column::with_capacity(5)
-            .spacing(9)
+            .spacing(10)
             .align_x(Alignment::Center)
-            .push(text(if filtering { "⌕" } else { "▶" }).size(24).color(LINE))
-            .push(text(if filtering {
-                "По фильтру ничего не найдено"
-            } else {
-                "Библиотека пуста"
-            }))
+            .push(
+                container(
+                    text(if filtering { "⌕" } else { "▶" })
+                        .size(28)
+                        .color(tint(color, 0.85)),
+                )
+                .center(62)
+                .style(move |_: &Theme| container::Style {
+                    background: Some(Background::Gradient(gradient(
+                        0.7,
+                        tint(color, 0.18),
+                        tint(color, 0.035),
+                    ))),
+                    border: Border {
+                        color: tint(color, 0.28),
+                        width: 1.0,
+                        radius: Radius::from(999.0),
+                    },
+                    ..Default::default()
+                }),
+            )
+            .push(title(
+                if filtering {
+                    "По фильтру ничего не найдено"
+                } else {
+                    "Библиотека пуста"
+                },
+                16.0,
+            ))
             .push(
                 text(empty_hint(state, filtering))
                     .size(11)
                     .color(MUTED)
+                    .align_x(Alignment::Center)
                     .wrapping(text::Wrapping::Word),
             )
             .push(
                 Row::with_capacity(2)
                     .spacing(8)
-                    .push(action("новая игра", Message::New))
+                    .push(action("+  новая игра", Message::New))
                     .push(ghost("перечитать конфиг", Message::Reload)),
             ),
     )
-    .padding([4, 10])
+    .padding([8, 10])
     .width(Length::Fill)
     .into()
 }
@@ -4282,9 +4732,28 @@ fn pane_empty(state: &State) -> Element<'static, Message> {
          запуска, а также кнопки запуска, редактирования и удаления"
     };
     container(
-        Column::with_capacity(1)
+        Column::with_capacity(3)
             .width(Length::Fill)
+            .spacing(10)
             .align_x(Alignment::Center)
+            .push(
+                container(text("◈").size(24).color(tint(PRIMARY, 0.7)))
+                    .center(54)
+                    .style(|_: &Theme| container::Style {
+                        background: Some(Background::Gradient(gradient(
+                            0.7,
+                            tint(PRIMARY, 0.16),
+                            tint(PRIMARY, 0.03),
+                        ))),
+                        border: Border {
+                            color: tint(PRIMARY, 0.26),
+                            width: 1.0,
+                            radius: Radius::from(999.0),
+                        },
+                        ..Default::default()
+                    }),
+            )
+            .push(title("здесь появится карточка игры", 15.0))
             .push(
                 text(body)
                     .size(11)
@@ -4297,7 +4766,7 @@ fn pane_empty(state: &State) -> Element<'static, Message> {
     // подсказка стоит сразу под заголовком: карточка сохраняет размер, когда
     // игру выберут, и список не прыгает.
     .width(Length::Fill)
-    .padding([14, 10])
+    .padding([16, 10])
     .into()
 }
 
@@ -4308,6 +4777,7 @@ fn dl_body(state: &State) -> Element<'_, Message> {
     let job = state.dl_job.as_ref();
     let busy = job.is_some();
     let listing = state.dl_status == DlStatus::Listing;
+    let banner_t = state.banner_anim.interpolate(0.0, 1.0, Instant::now());
     let status = if let Some(progress) = job {
         let written = human_size(progress.written());
         if progress.cancelled() {
@@ -4360,8 +4830,15 @@ fn dl_body(state: &State) -> Element<'_, Message> {
                 .push(ghost("закрыть", Message::DlToggle)),
         );
 
-    if let Some(part) = job.and_then(|p| p.fraction()) {
-        col = col.push(progress_bar(0.0..=1.0, part).girth(Length::Fixed(8.0)));
+    if job.and_then(|p| p.fraction()).is_some() {
+        let shown = state
+            .progress_anim
+            .interpolate_with(|value| value, Instant::now());
+        col = col.push(
+            progress_bar(0.0..=1.0, shown)
+                .girth(Length::Fixed(9.0))
+                .style(progress_style),
+        );
     }
 
     if state.dl_releases.is_empty() {
@@ -4384,7 +4861,8 @@ fn dl_body(state: &State) -> Element<'_, Message> {
                 Message::DlChosen,
             )
             .text_size(13)
-            .padding([7, 10])
+            .padding([8, 11])
+            .style(pick_style)
             .width(Length::Fill),
         ));
         if let Some(release) = &state.dl_chosen {
@@ -4442,7 +4920,7 @@ fn dl_body(state: &State) -> Element<'_, Message> {
     }
 
     if let Some(e) = &state.dl_error {
-        col = col.push(banner("✕", "ошибка", e.clone(), DANGER));
+        col = col.push(banner("✕", "ошибка", e.clone(), DANGER, banner_t));
     }
 
     col = col.push(
@@ -4516,53 +4994,103 @@ fn dl_body(state: &State) -> Element<'_, Message> {
     col.into()
 }
 
-fn game_row<'a>(state: &'a State, i: usize, g: &'a Game) -> Element<'a, Message> {
+fn game_row<'a>(state: &'a State, i: usize, g: &'a Game, glow: f32) -> Element<'a, Message> {
     let running = g.child.is_some();
     let selected = state.selected == Some(i);
-    let (mark, mark_color) = if running {
-        ("●", SUCCESS)
-    } else if g.exit.is_some() {
-        ("●", status_color(g))
+    let now = Instant::now();
+    let pulse = if running {
+        state.pulse_anim.interpolate_with(|value| value, now)
     } else {
-        ("○", LINE)
+        0.0
+    };
+    let mark_color = if running {
+        mix(SUCCESS, Color::WHITE, pulse * 0.35)
+    } else if g.exit.is_some() {
+        status_color(g)
+    } else {
+        MUTED
+    };
+    let tile_color = if running {
+        SUCCESS
+    } else if selected {
+        PRIMARY
+    } else {
+        MUTED
     };
     let inner = Row::with_capacity(5)
-        .spacing(10)
+        .spacing(11)
         .align_y(Alignment::Center)
         .push(
             container(Space::new().width(3.0))
                 .height(Length::Fill)
                 .style(move |_: &Theme| container::Style {
-                    background: Some(Background::Color(if selected {
-                        PRIMARY
-                    } else {
-                        Color::TRANSPARENT
-                    })),
+                    background: Some(Background::Color(tint(
+                        PRIMARY,
+                        if selected { glow } else { 0.0 },
+                    ))),
                     border: Border {
-                        radius: Radius::from(2.0),
+                        radius: Radius::from(999.0),
                         ..Default::default()
                     },
                     ..Default::default()
                 }),
         )
-        .push(text(mark).size(9).color(mark_color))
+        .push(
+            container(Space::new().width(9.0).height(9.0)).style(move |_: &Theme| {
+                container::Style {
+                    background: Some(Background::Color(mark_color)),
+                    border: Border {
+                        radius: Radius::from(999.0),
+                        ..Default::default()
+                    },
+                    shadow: if running {
+                        glow_shadow(SUCCESS, 0.35 + pulse * 0.35, 0.0, 9.0)
+                    } else {
+                        Shadow::default()
+                    },
+                    ..Default::default()
+                }
+            }),
+        )
+        .push(game_tile(&g.cfg.name, tile_color))
         .push(
             Column::with_capacity(2)
                 .spacing(2)
                 .width(Length::Fill)
-                .push(text(g.cfg.name.clone()).size(14))
-                .push(text(sub_line(g)).size(11).color(status_color(g))),
+                .push(
+                    container(
+                        text(g.cfg.name.clone())
+                            .size(14)
+                            .font(Font {
+                                weight: Weight::Semibold,
+                                ..Font::DEFAULT
+                            })
+                            .color(TEXT)
+                            .wrapping(text::Wrapping::Word),
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
+                )
+                .push(
+                    container(
+                        text(sub_line(g, state))
+                            .size(11)
+                            .color(status_color(g))
+                            .wrapping(text::Wrapping::Word),
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
+                ),
         )
-        .push(chip(runner_tag(g, state), RUNNER_TINT))
         .push(if running {
-            danger("стоп", Message::Stop(i))
+            danger("■", Message::Stop(i))
         } else {
-            action("▶  запустить", Message::Start(i))
+            action("▶", Message::Start(i))
         });
     button(inner)
-        .padding([9, 11])
+        .padding([10, 12])
         .width(Length::Fill)
-        .style(row_style(selected))
+        .style(row_style(selected, glow))
         .on_press(Message::Select(i))
         .into()
 }
@@ -4593,8 +5121,8 @@ fn empty_hint(state: &State, has_games: bool) -> String {
     }
 }
 
-fn sub_line(g: &Game) -> String {
-    if let Some(child) = &g.child {
+fn sub_line(g: &Game, state: &State) -> String {
+    let detail = if let Some(child) = &g.child {
         let secs = g.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         format!(
             "идёт {:02}:{:02} · pid {} · {}",
@@ -4607,7 +5135,8 @@ fn sub_line(g: &Game) -> String {
         format!("завершена: {e} · {}", short_path(&g.cfg.exe))
     } else {
         short_path(&g.cfg.exe)
-    }
+    };
+    format!("{} · {detail}", runner_tag(g, state))
 }
 
 fn runner_tag(g: &Game, state: &State) -> String {
@@ -5353,5 +5882,44 @@ DXVK_HUD = "compiler"
             window_icon(include_bytes!("../assets/hicolor/64x64/apps/protonaut.png")).is_some(),
             "окно без значка — в панели будет заглушка"
         );
+    }
+
+    /// Баннер загрузки Proton участвует в общем переходе и не висит в воздухе:
+    /// сначала кадры идут, потом окно снова засыпает.
+    #[test]
+    fn banner_transition_covers_download_errors_and_settles() {
+        let mut state = State::new();
+        state.games.clear();
+        state.error = None;
+        state.warn = None;
+        state.notice = None;
+        state.dl_error = None;
+        state.settings_open = false;
+        state.dl_open = false;
+        state.selected = None;
+        state.draft = None;
+        state.dl_job = None;
+
+        let start = Instant::now();
+        state.sync_animations(start);
+        assert!(!state.animating(start), "в простое кадры не нужны");
+
+        state.dl_error = Some("boom".to_string());
+        state.sync_animations(start);
+        assert!(
+            state.animating(start),
+            "ошибка загрузки не запустила переход"
+        );
+
+        state.dl_error = None;
+        let later = start
+            .checked_add(Duration::from_millis(500))
+            .expect("время только вперёд");
+        state.sync_animations(later);
+        let settled = later
+            .checked_add(Duration::from_millis(300))
+            .expect("время только вперёд");
+        state.sync_animations(settled);
+        assert!(!state.animating(settled), "переход не остановился");
     }
 }
